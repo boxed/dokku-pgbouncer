@@ -102,6 +102,14 @@ case "$1" in
     dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
     dokku apps:destroy "$BOUNCER_APP" --force
 
+    # Remove all DOKKU_POSTGRES_* vars and DATABASE_URL that we set
+    VARS_TO_UNSET=$(dokku config:keys "$MAIN_APP" 2>/dev/null | grep "^DOKKU_POSTGRES_" || true)
+    if [[ -n "$VARS_TO_UNSET" ]]; then
+      dokku_log_info1 "Removing pgbouncer env vars from $MAIN_APP"
+      # shellcheck disable=SC2086
+      dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET
+    fi
+
     if [[ -n "$DB_SERVICE" ]]; then
       dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
       dokku postgres:link "$DB_SERVICE" "$MAIN_APP"
