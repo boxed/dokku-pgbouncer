@@ -75,6 +75,15 @@ case "$1" in
     dokku_log_info1 "Deploying pgbouncer image"
     dokku git:from-image "$BOUNCER_APP" pgbouncer/pgbouncer:latest || dokku_log_fail "Failed to deploy pgbouncer image"
 
+    # Verify pgbouncer can connect to postgres before touching the main app
+    dokku_log_info1 "Verifying pgbouncer can reach postgres"
+    BOUNCER_IP=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${BOUNCER_APP}.web.1") \
+      || dokku_log_fail "Failed to get pgbouncer container IP"
+    if ! PGPASSWORD="$DB_PASSWORD" psql -h "$BOUNCER_IP" -p 6432 -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1" >/dev/null 2>&1; then
+      dokku_log_fail "pgbouncer cannot connect to postgres. Aborting before modifying $MAIN_APP. Check pgbouncer logs: dokku logs $BOUNCER_APP"
+    fi
+    dokku_log_info1 "pgbouncer connection verified"
+
     # Store metadata so remove-intercept-db can undo everything
     dokku_log_info1 "Storing metadata on $BOUNCER_APP"
     dokku config:set --no-restart "$BOUNCER_APP" \
