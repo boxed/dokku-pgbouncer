@@ -185,7 +185,10 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
     dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET || dokku_log_fail "Failed to unset env vars on $MAIN_APP"
 
     dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
-    dokku postgres:link "$DB_SERVICE" "$MAIN_APP" || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
+    dokku postgres:link --no-restart "$DB_SERVICE" "$MAIN_APP" || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
+
+    dokku_log_info1 "Rebuilding $MAIN_APP"
+    dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
     ;;
 
   pgbouncer:info)
