@@ -54,39 +54,43 @@ case "$1" in
     # Store the service name so destroy can auto-relink
     dokku config:set --no-restart "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE="$DB_SERVICE"
 
-    # Capture all DOKKU_POSTGRES_* vars before unlinking
     SERVICE_UPPER=$(echo "$DB_SERVICE" | tr '[:lower:]-' '[:upper:]_')
     PREFIX="DOKKU_POSTGRES_${SERVICE_UPPER}_"
-    SAVED_VARS=$(dokku config:show "$MAIN_APP" | grep "^${PREFIX}" || true)
-
-    # Unlink postgres so it stops owning these vars
-    dokku_log_info1 "Unlinking postgres service $DB_SERVICE from $MAIN_APP"
-    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" --no-restart
-
-    # Restore the saved vars, overriding connectivity ones to point to pgbouncer
     BOUNCER_HOST="${BOUNCER_APP}.web"
     BOUNCER_PORT="6432"
 
-    # Build config:set args from saved vars
-    CONFIG_ARGS=()
-    while IFS=: read -r key value; do
-      key=$(echo "$key" | xargs)
-      value=$(echo "$value" | sed 's/^ *//')
-      [[ -z "$key" ]] && continue
-      CONFIG_ARGS+=("${key}=${value}")
-    done <<< "$SAVED_VARS"
+    # Read env vars from the postgres container before unlinking
+    CONTAINER_ID=$(dokku postgres:info "$DB_SERVICE" --id)
+    PG_ENV=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_ID")
 
-    # Override the connectivity vars and DATABASE_URL to point through pgbouncer
-    CONFIG_ARGS+=(
-      "DATABASE_URL=postgres://${DB_USER}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}"
-      "${PREFIX}PORT_5432_TCP_ADDR=${BOUNCER_HOST}"
-      "${PREFIX}PORT_5432_TCP_PORT=${BOUNCER_PORT}"
-      "${PREFIX}PORT_5432_TCP=tcp://${BOUNCER_HOST}:${BOUNCER_PORT}"
-      "${PREFIX}PORT=tcp://${BOUNCER_HOST}:${BOUNCER_PORT}"
-    )
+    # Extract postgres container env vars we need to preserve
+    PG_VERSION=$(echo "$PG_ENV" | grep "^PG_VERSION=" | cut -d= -f2-)
+    PG_MAJOR=$(echo "$PG_ENV" | grep "^PG_MAJOR=" | cut -d= -f2-)
+    PG_LANG=$(echo "$PG_ENV" | grep "^LANG=" | cut -d= -f2-)
+    PG_PGDATA=$(echo "$PG_ENV" | grep "^PGDATA=" | cut -d= -f2-)
+    PG_GOSU=$(echo "$PG_ENV" | grep "^GOSU_VERSION=" | cut -d= -f2-)
+    PG_PASSWORD=$(echo "$PG_ENV" | grep "^POSTGRES_PASSWORD=" | cut -d= -f2-)
 
+    # Unlink postgres so it stops owning the runtime vars
+    dokku_log_info1 "Unlinking postgres service $DB_SERVICE from $MAIN_APP"
+    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" --no-restart
+
+    # Set all DOKKU_POSTGRES_* vars explicitly, with connectivity pointing to pgbouncer
     dokku_log_info1 "Updating $MAIN_APP to use pgbouncer"
-    dokku config:set "$MAIN_APP" "${CONFIG_ARGS[@]}"
+    dokku config:set "$MAIN_APP" \
+      DATABASE_URL="postgres://${DB_USER}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}" \
+      "${PREFIX}PORT_5432_TCP_ADDR=${BOUNCER_HOST}" \
+      "${PREFIX}PORT_5432_TCP_PORT=${BOUNCER_PORT}" \
+      "${PREFIX}PORT_5432_TCP_PROTO=tcp" \
+      "${PREFIX}PORT_5432_TCP=tcp://${BOUNCER_HOST}:${BOUNCER_PORT}" \
+      "${PREFIX}PORT=tcp://${BOUNCER_HOST}:${BOUNCER_PORT}" \
+      "${PREFIX}NAME=/${MAIN_APP}.web.1/dokku-postgres-${DB_SERVICE}" \
+      "${PREFIX}ENV_POSTGRES_PASSWORD=${PG_PASSWORD}" \
+      "${PREFIX}ENV_PG_VERSION=${PG_VERSION}" \
+      "${PREFIX}ENV_PG_MAJOR=${PG_MAJOR}" \
+      "${PREFIX}ENV_LANG=${PG_LANG}" \
+      "${PREFIX}ENV_PGDATA=${PG_PGDATA}" \
+      "${PREFIX}ENV_GOSU_VERSION=${PG_GOSU}"
 
     dokku_log_info1 "Done! $MAIN_APP is now using pgbouncer via $BOUNCER_APP"
     ;;
