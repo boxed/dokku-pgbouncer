@@ -139,18 +139,27 @@ case "$1" in
 
   pgbouncer:remove-intercept-db)
     [[ -z "$2" ]] && dokku_log_fail "Please specify a main app name"
+    [[ -z "$3" ]] && dokku_log_fail "Please specify a postgres service name"
     MAIN_APP="$2"
+    DB_SERVICE="$3"
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
+    NETWORK_NAME="pgbouncer-${MAIN_APP}"
 
-    # Retrieve metadata before destroying
-    DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE) || dokku_log_fail "Failed to read DOKKU_PGBOUNCER_DB_SERVICE from $BOUNCER_APP. Is pgbouncer set up for this app?"
-    NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK) || dokku_log_fail "Failed to read DOKKU_PGBOUNCER_NETWORK from $BOUNCER_APP"
+    # Try to read metadata from pgbouncer app if it still exists
+    STORED_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+    STORED_NETWORK=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+    [[ -n "$STORED_NETWORK" ]] && NETWORK_NAME="$STORED_NETWORK"
 
-    dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
-    dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_fail "Failed to destroy $BOUNCER_APP"
+    # Destroy pgbouncer app if it exists
+    if dokku apps:exists "$BOUNCER_APP" 2>/dev/null; then
+      dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
+      dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_fail "Failed to destroy $BOUNCER_APP"
+    else
+      dokku_log_info1 "Pgbouncer app $BOUNCER_APP does not exist, skipping destroy"
+    fi
 
-    # Remove network attachments and delete the network
-    if [[ -n "$NETWORK_NAME" ]]; then
+    # Remove network if it exists
+    if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
       dokku_log_info1 "Removing network: $NETWORK_NAME"
       dokku network:set "$MAIN_APP" attach-post-create "" || dokku_log_fail "Failed to detach network from $MAIN_APP"
 
@@ -162,15 +171,15 @@ case "$1" in
       done
 
       docker network rm "$NETWORK_NAME" || dokku_log_fail "Failed to remove docker network $NETWORK_NAME"
+    else
+      dokku_log_info1 "Network $NETWORK_NAME does not exist, skipping removal"
     fi
 
     # Remove all DOKKU_POSTGRES_* vars and DATABASE_URL that we set
+    dokku_log_info1 "Removing pgbouncer env vars from $MAIN_APP"
     VARS_TO_UNSET=$(dokku config:keys "$MAIN_APP" | grep "^DOKKU_POSTGRES_" || true)
-    if [[ -n "$VARS_TO_UNSET" ]]; then
-      dokku_log_info1 "Removing pgbouncer env vars from $MAIN_APP"
-      # shellcheck disable=SC2086
-      dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET || dokku_log_fail "Failed to unset env vars on $MAIN_APP"
-    fi
+    # shellcheck disable=SC2086
+    dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET || dokku_log_fail "Failed to unset env vars on $MAIN_APP"
 
     dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
     dokku postgres:link "$DB_SERVICE" "$MAIN_APP" || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
@@ -189,7 +198,7 @@ case "$1" in
       declare desc="return pgbouncer plugin help content"
       cat <<EOF
     pgbouncer:intercept-db <app> <service>, Intercept an app's db connection through pgbouncer
-    pgbouncer:remove-intercept-db <app>, Remove pgbouncer and restore direct db connection
+    pgbouncer:remove-intercept-db <app> <service>, Remove pgbouncer and restore direct db connection
     pgbouncer:info <app>, Show pgbouncer config for an app
 EOF
     }
