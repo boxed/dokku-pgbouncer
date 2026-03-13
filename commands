@@ -77,8 +77,9 @@ case "$1" in
 
     # Verify pgbouncer can connect to postgres before touching the main app
     dokku_log_info1 "Verifying pgbouncer can reach postgres"
-    BOUNCER_HOST_IP=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${BOUNCER_APP}.web.1") \
-      || dokku_log_fail "Failed to get pgbouncer container IP"
+    BOUNCER_HOST_IP=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${NETWORK_NAME}\").IPAddress}}" "${BOUNCER_APP}.web.1") \
+      || dokku_log_fail "Failed to get pgbouncer container IP on network $NETWORK_NAME"
+    [[ -z "$BOUNCER_HOST_IP" ]] && dokku_log_fail "Pgbouncer container has no IP on network $NETWORK_NAME"
     VERIFY_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST_IP}:6432/${DB_NAME}" -c "SELECT 1" 2>&1) || {
       dokku_log_fail "pgbouncer cannot connect to postgres. Aborting before modifying $MAIN_APP.
 Output: $VERIFY_OUTPUT
