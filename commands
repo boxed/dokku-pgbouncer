@@ -121,7 +121,7 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
 
     # Set all DOKKU_POSTGRES_* vars explicitly, with connectivity pointing to pgbouncer
     dokku_log_info1 "Updating $MAIN_APP to use pgbouncer"
-    dokku config:set "$MAIN_APP" \
+    dokku config:set --no-restart "$MAIN_APP" \
       DATABASE_URL="postgres://${DB_USER}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}" \
       "${PREFIX}PORT_5432_TCP_ADDR=${BOUNCER_HOST}" \
       "${PREFIX}PORT_5432_TCP_PORT=${BOUNCER_PORT}" \
@@ -136,6 +136,9 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
       "${PREFIX}ENV_PGDATA=${PG_PGDATA}" \
       "${PREFIX}ENV_GOSU_VERSION=${PG_GOSU}" \
       || dokku_log_fail "Failed to set env vars on $MAIN_APP"
+
+    dokku_log_info1 "Rebuilding $MAIN_APP"
+    dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
 
     dokku_log_info1 "Done! $MAIN_APP is now using pgbouncer via $BOUNCER_APP"
     ;;
