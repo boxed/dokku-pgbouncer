@@ -175,11 +175,16 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
     if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
       dokku_log_info1 "Removing network: $NETWORK_NAME"
 
-      # Disconnect all containers from the network before removing it
-      CONNECTED=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}')
-      for CONTAINER in $CONNECTED; do
-        dokku_log_info1 "Disconnecting $CONTAINER from $NETWORK_NAME"
-        docker network disconnect -f "$NETWORK_NAME" "$CONTAINER" || dokku_log_warn "Warning: could not disconnect $CONTAINER from $NETWORK_NAME (likely already disconnected during app destroy, this is safe to ignore)"
+      # Disconnect all containers from the network before removing it.
+      # We loop because container IDs can change between inspect and disconnect
+      # (e.g. app rebuilds triggered by the pgbouncer destroy above).
+      for ATTEMPT in 1 2 3; do
+        CONNECTED=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}')
+        [[ -z "$CONNECTED" ]] && break
+        for CONTAINER in $CONNECTED; do
+          dokku_log_info1 "Disconnecting $CONTAINER from $NETWORK_NAME"
+          docker network disconnect -f "$NETWORK_NAME" "$CONTAINER" || dokku_log_warn "Warning: could not disconnect $CONTAINER from $NETWORK_NAME (likely already disconnected, this is safe to ignore)"
+        done
       done
 
       docker network rm "$NETWORK_NAME" || dokku_log_fail "Failed to remove docker network $NETWORK_NAME"
