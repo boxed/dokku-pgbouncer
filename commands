@@ -117,7 +117,7 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
 
     # Unlink postgres so it stops owning the runtime vars
     dokku_log_info1 "Unlinking postgres service $DB_SERVICE from $MAIN_APP"
-    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" --no-restart || dokku_log_fail "Failed to unlink postgres service $DB_SERVICE from $MAIN_APP"
+    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" -n || dokku_log_fail "Failed to unlink postgres service $DB_SERVICE from $MAIN_APP"
 
     # Set all DOKKU_POSTGRES_* vars explicitly, with connectivity pointing to pgbouncer
     dokku_log_info1 "Updating $MAIN_APP to use pgbouncer"
@@ -149,8 +149,8 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
 
     # Try to read metadata from pgbouncer app if it still exists
-    STORED_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
-    STORED_NETWORK=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+    STORED_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE || true)
+    STORED_NETWORK=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK || true)
     [[ -n "$STORED_NETWORK" ]] && NETWORK_NAME="$STORED_NETWORK"
 
     # Destroy pgbouncer app if it exists
@@ -185,7 +185,7 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
     dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET || dokku_log_fail "Failed to unset env vars on $MAIN_APP"
 
     dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
-    dokku postgres:link "$DB_SERVICE" "$MAIN_APP" --no-restart || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
+    dokku postgres:link "$DB_SERVICE" "$MAIN_APP" -n || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
 
     dokku_log_info1 "Rebuilding $MAIN_APP"
     dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
