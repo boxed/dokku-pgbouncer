@@ -14,11 +14,10 @@ case "$1" in
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
 
     # Get DATABASE_URL from the main app (set by postgres:link)
-    DATABASE_URL=$(dokku config:get "$MAIN_APP" DATABASE_URL 2>/dev/null || true)
+    DATABASE_URL=$(dokku config:get "$MAIN_APP" DATABASE_URL) || dokku_log_fail "Failed to read DATABASE_URL from $MAIN_APP"
     [[ -z "$DATABASE_URL" ]] && dokku_log_fail "No DATABASE_URL found on $MAIN_APP. Link a postgres service first."
 
     # Parse DATABASE_URL: postgres://USER:PASSWORD@HOST:PORT/DB
-    # Strip the scheme
     URL_BODY="${DATABASE_URL#postgres://}"
     URL_BODY="${URL_BODY#postgresql://}"
 
@@ -30,26 +29,36 @@ case "$1" in
 
     HOSTPORT="${HOSTINFO%%/*}"
     DB_NAME="${HOSTINFO#*/}"
-    # Strip query params from DB_NAME
     DB_NAME="${DB_NAME%%\?*}"
 
     DB_HOST="${HOSTPORT%%:*}"
     DB_PORT="${HOSTPORT#*:}"
     [[ "$DB_PORT" == "$DB_HOST" ]] && DB_PORT="5432"
 
+    [[ -z "$DB_USER" ]] && dokku_log_fail "Failed to parse user from DATABASE_URL"
+    [[ -z "$DB_HOST" ]] && dokku_log_fail "Failed to parse host from DATABASE_URL"
+    [[ -z "$DB_NAME" ]] && dokku_log_fail "Failed to parse database name from DATABASE_URL"
+
     # Create a shared network for the app, pgbouncer, and postgres
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
     dokku_log_info1 "Creating network: $NETWORK_NAME"
-    docker network create "$NETWORK_NAME" 2>/dev/null || true
+    docker network create "$NETWORK_NAME" 2>/dev/null || dokku_log_info1 "Network $NETWORK_NAME already exists"
 
     dokku_log_info1 "Creating pgbouncer app: $BOUNCER_APP"
-    dokku apps:create "$BOUNCER_APP"
+    dokku apps:create "$BOUNCER_APP" || dokku_log_fail "Failed to create app $BOUNCER_APP"
 
     # Attach the network to all three: main app, pgbouncer, and postgres
-    dokku network:set "$MAIN_APP" attach-post-create "$NETWORK_NAME"
-    dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME"
-    dokku postgres:set "$DB_SERVICE" post-create-network "$NETWORK_NAME"
-    dokku postgres:restart "$DB_SERVICE"
+    dokku_log_info1 "Attaching network to $MAIN_APP"
+    dokku network:set "$MAIN_APP" attach-post-create "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to $MAIN_APP"
+
+    dokku_log_info1 "Attaching network to $BOUNCER_APP"
+    dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to $BOUNCER_APP"
+
+    dokku_log_info1 "Attaching network to postgres service $DB_SERVICE"
+    dokku postgres:set "$DB_SERVICE" post-create-network "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to postgres service $DB_SERVICE"
+
+    dokku_log_info1 "Restarting postgres service $DB_SERVICE"
+    dokku postgres:restart "$DB_SERVICE" || dokku_log_fail "Failed to restart postgres service $DB_SERVICE"
 
     dokku_log_info1 "Setting pgbouncer config"
     dokku config:set --no-restart "$BOUNCER_APP" \
@@ -57,26 +66,31 @@ case "$1" in
       DATABASES_USER="$DB_USER" \
       DATABASES_PASSWORD="$DB_PASSWORD" \
       DATABASES_PORT="$DB_PORT" \
-      DATABASES_DB="$DB_NAME"
+      DATABASES_DB="$DB_NAME" \
+      || dokku_log_fail "Failed to set pgbouncer config on $BOUNCER_APP"
 
     dokku_log_info1 "Deploying pgbouncer image"
-    dokku git:from-image "$BOUNCER_APP" pgbouncer/pgbouncer:latest
+    dokku git:from-image "$BOUNCER_APP" pgbouncer/pgbouncer:latest || dokku_log_fail "Failed to deploy pgbouncer image"
 
     # Store metadata so remove-intercept-db can undo everything
+    dokku_log_info1 "Storing metadata on $BOUNCER_APP"
     dokku config:set --no-restart "$BOUNCER_APP" \
       DOKKU_PGBOUNCER_DB_SERVICE="$DB_SERVICE" \
-      DOKKU_PGBOUNCER_NETWORK="$NETWORK_NAME"
+      DOKKU_PGBOUNCER_NETWORK="$NETWORK_NAME" \
+      || dokku_log_fail "Failed to store metadata on $BOUNCER_APP"
 
     SERVICE_UPPER=$(echo "$DB_SERVICE" | tr '[:lower:]-' '[:upper:]_')
     PREFIX="DOKKU_POSTGRES_${SERVICE_UPPER}_"
     BOUNCER_HOST="${BOUNCER_APP}.web"
     BOUNCER_PORT="6432"
 
-    # Read env vars from the postgres container before unlinking
-    CONTAINER_ID=$(dokku postgres:info "$DB_SERVICE" --id)
-    PG_ENV=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_ID")
+    # Read env vars from the postgres container
+    dokku_log_info1 "Reading postgres container env vars"
+    CONTAINER_ID=$(dokku postgres:info "$DB_SERVICE" --id) || dokku_log_fail "Failed to get postgres container ID for $DB_SERVICE"
+    [[ -z "$CONTAINER_ID" ]] && dokku_log_fail "Got empty container ID for postgres service $DB_SERVICE"
 
-    # Extract postgres container env vars we need to preserve
+    PG_ENV=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_ID") || dokku_log_fail "Failed to inspect postgres container $CONTAINER_ID"
+
     PG_VERSION=$(echo "$PG_ENV" | grep "^PG_VERSION=" | cut -d= -f2-)
     PG_MAJOR=$(echo "$PG_ENV" | grep "^PG_MAJOR=" | cut -d= -f2-)
     PG_LANG=$(echo "$PG_ENV" | grep "^LANG=" | cut -d= -f2-)
@@ -84,9 +98,11 @@ case "$1" in
     PG_GOSU=$(echo "$PG_ENV" | grep "^GOSU_VERSION=" | cut -d= -f2-)
     PG_PASSWORD=$(echo "$PG_ENV" | grep "^POSTGRES_PASSWORD=" | cut -d= -f2-)
 
+    [[ -z "$PG_PASSWORD" ]] && dokku_log_fail "Failed to read POSTGRES_PASSWORD from postgres container"
+
     # Unlink postgres so it stops owning the runtime vars
     dokku_log_info1 "Unlinking postgres service $DB_SERVICE from $MAIN_APP"
-    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" --no-restart
+    dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" --no-restart || dokku_log_fail "Failed to unlink postgres service $DB_SERVICE from $MAIN_APP"
 
     # Set all DOKKU_POSTGRES_* vars explicitly, with connectivity pointing to pgbouncer
     dokku_log_info1 "Updating $MAIN_APP to use pgbouncer"
@@ -103,7 +119,8 @@ case "$1" in
       "${PREFIX}ENV_PG_MAJOR=${PG_MAJOR}" \
       "${PREFIX}ENV_LANG=${PG_LANG}" \
       "${PREFIX}ENV_PGDATA=${PG_PGDATA}" \
-      "${PREFIX}ENV_GOSU_VERSION=${PG_GOSU}"
+      "${PREFIX}ENV_GOSU_VERSION=${PG_GOSU}" \
+      || dokku_log_fail "Failed to set env vars on $MAIN_APP"
 
     dokku_log_info1 "Done! $MAIN_APP is now using pgbouncer via $BOUNCER_APP"
     ;;
@@ -114,35 +131,30 @@ case "$1" in
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
 
     # Retrieve metadata before destroying
-    DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
-    NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+    DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE) || dokku_log_fail "Failed to read DOKKU_PGBOUNCER_DB_SERVICE from $BOUNCER_APP. Is pgbouncer set up for this app?"
+    NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK) || dokku_log_fail "Failed to read DOKKU_PGBOUNCER_NETWORK from $BOUNCER_APP"
 
     dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
-    dokku apps:destroy "$BOUNCER_APP" --force
+    dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_fail "Failed to destroy $BOUNCER_APP"
 
     # Remove network attachments and delete the network
     if [[ -n "$NETWORK_NAME" ]]; then
       dokku_log_info1 "Removing network: $NETWORK_NAME"
-      dokku network:set "$MAIN_APP" attach-post-create ""
-      [[ -n "$DB_SERVICE" ]] && dokku postgres:set "$DB_SERVICE" post-create-network ""
-      docker network rm "$NETWORK_NAME" 2>/dev/null || true
+      dokku network:set "$MAIN_APP" attach-post-create "" || dokku_log_fail "Failed to detach network from $MAIN_APP"
+      dokku postgres:set "$DB_SERVICE" post-create-network "" || dokku_log_fail "Failed to detach network from postgres service $DB_SERVICE"
+      docker network rm "$NETWORK_NAME" || dokku_log_fail "Failed to remove docker network $NETWORK_NAME"
     fi
 
     # Remove all DOKKU_POSTGRES_* vars and DATABASE_URL that we set
-    VARS_TO_UNSET=$(dokku config:keys "$MAIN_APP" 2>/dev/null | grep "^DOKKU_POSTGRES_" || true)
+    VARS_TO_UNSET=$(dokku config:keys "$MAIN_APP" | grep "^DOKKU_POSTGRES_" || true)
     if [[ -n "$VARS_TO_UNSET" ]]; then
       dokku_log_info1 "Removing pgbouncer env vars from $MAIN_APP"
       # shellcheck disable=SC2086
-      dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET
+      dokku config:unset --no-restart "$MAIN_APP" DATABASE_URL $VARS_TO_UNSET || dokku_log_fail "Failed to unset env vars on $MAIN_APP"
     fi
 
-    if [[ -n "$DB_SERVICE" ]]; then
-      dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
-      dokku postgres:link "$DB_SERVICE" "$MAIN_APP"
-    else
-      dokku_log_warn "Could not determine postgres service name. Restore DATABASE_URL manually:"
-      dokku_log_warn "  dokku postgres:link <service> $MAIN_APP"
-    fi
+    dokku_log_info1 "Restoring direct database connection for $MAIN_APP"
+    dokku postgres:link "$DB_SERVICE" "$MAIN_APP" || dokku_log_fail "Failed to link postgres service $DB_SERVICE to $MAIN_APP"
     ;;
 
   pgbouncer:info)
@@ -150,7 +162,7 @@ case "$1" in
     MAIN_APP="$2"
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
 
-    dokku config:show "$BOUNCER_APP"
+    dokku config:show "$BOUNCER_APP" || dokku_log_fail "Failed to show config for $BOUNCER_APP. Is pgbouncer set up for this app?"
     ;;
 
   help | pgbouncer:help)
