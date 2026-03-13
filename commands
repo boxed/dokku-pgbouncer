@@ -153,7 +153,14 @@ case "$1" in
     if [[ -n "$NETWORK_NAME" ]]; then
       dokku_log_info1 "Removing network: $NETWORK_NAME"
       dokku network:set "$MAIN_APP" attach-post-create "" || dokku_log_fail "Failed to detach network from $MAIN_APP"
-      docker network disconnect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" 2>/dev/null || dokku_log_info1 "Postgres container already disconnected from network"
+
+      # Disconnect all containers from the network before removing it
+      CONNECTED=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null || true)
+      for CONTAINER in $CONNECTED; do
+        dokku_log_info1 "Disconnecting $CONTAINER from $NETWORK_NAME"
+        docker network disconnect "$NETWORK_NAME" "$CONTAINER" || dokku_log_fail "Failed to disconnect $CONTAINER from $NETWORK_NAME"
+      done
+
       docker network rm "$NETWORK_NAME" || dokku_log_fail "Failed to remove docker network $NETWORK_NAME"
     fi
 
