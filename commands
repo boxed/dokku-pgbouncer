@@ -55,13 +55,13 @@ case "$1" in
     dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to $BOUNCER_APP"
 
     dokku_log_info1 "Attaching postgres service $DB_SERVICE to network"
-    if docker network connect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" 2>&1; then
-      true
-    elif docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}' | grep -q "dokku.postgres.${DB_SERVICE}"; then
-      dokku_log_info1 "Postgres container already on network $NETWORK_NAME"
-    else
-      dokku_log_fail "Failed to connect postgres container dokku.postgres.${DB_SERVICE} to network $NETWORK_NAME"
-    fi
+    CONNECT_OUTPUT=$(docker network connect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" 2>&1) || {
+      if echo "$CONNECT_OUTPUT" | grep -q "already exists"; then
+        dokku_log_info1 "Postgres container already on network $NETWORK_NAME"
+      else
+        dokku_log_fail "Failed to connect postgres container dokku.postgres.${DB_SERVICE} to network $NETWORK_NAME: $CONNECT_OUTPUT"
+      fi
+    }
 
     dokku_log_info1 "Setting pgbouncer config"
     dokku config:set --no-restart "$BOUNCER_APP" \
