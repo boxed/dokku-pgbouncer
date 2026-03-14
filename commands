@@ -99,7 +99,7 @@ case "$1" in
 
     # Verify from inside the main app container that it can reach pgbouncer
     dokku_log_info1 "Verifying pgbouncer connectivity from inside $MAIN_APP"
-    VERIFY_OUTPUT=$(docker exec "${MAIN_APP}.web.1" bash -c "echo 'SELECT 1;' | nc -w 3 \$PGBOUNCER_HOST \$PGBOUNCER_PORT" 2>&1) || {
+    VERIFY_OUTPUT=$(docker exec "${MAIN_APP}.web.1" bash -c "timeout 3 bash -c 'echo > /dev/tcp/\$PGBOUNCER_HOST/\$PGBOUNCER_PORT'" 2>&1) || {
       dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_HOST PGBOUNCER_PORT
       dokku_log_fail "Cannot reach pgbouncer at ${BOUNCER_HOST}:${BOUNCER_PORT} from inside ${MAIN_APP}.
 Output: $VERIFY_OUTPUT
