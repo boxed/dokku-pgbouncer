@@ -76,16 +76,29 @@ case "$1" in
     dokku git:from-image "$BOUNCER_APP" pgbouncer/pgbouncer:latest || dokku_log_fail "Failed to deploy pgbouncer image"
 
     # Verify pgbouncer can connect to postgres before touching the main app
+    BOUNCER_PORT="6432"
+
     dokku_log_info1 "Verifying pgbouncer can reach postgres"
     BOUNCER_HOST_IP=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${NETWORK_NAME}\").IPAddress}}" "${BOUNCER_APP}.web.1") \
       || dokku_log_fail "Failed to get pgbouncer container IP on network $NETWORK_NAME"
     [[ -z "$BOUNCER_HOST_IP" ]] && dokku_log_fail "Pgbouncer container has no IP on network $NETWORK_NAME"
-    VERIFY_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST_IP}:6432/${DB_NAME}" -c "SELECT 1" 2>&1) || {
+    VERIFY_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST_IP}:${BOUNCER_PORT}/${DB_NAME}" -c "SELECT 1" 2>&1) || {
       dokku_log_fail "pgbouncer cannot connect to postgres. Aborting before modifying $MAIN_APP.
 Output: $VERIFY_OUTPUT
 Check pgbouncer logs: dokku logs $BOUNCER_APP"
     }
-    dokku_log_info1 "pgbouncer connection verified"
+    dokku_log_info1 "pgbouncer connection verified via IP"
+
+    # Verify DNS resolution of the hostname the app will actually use
+    BOUNCER_HOST="${BOUNCER_APP}.web"
+    dokku_log_info1 "Verifying DNS resolution of ${BOUNCER_HOST} on network ${NETWORK_NAME}"
+    VERIFY_DNS_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}" -c "SELECT 1" 2>&1) || {
+      dokku_log_fail "DNS name ${BOUNCER_HOST} is not reachable from network ${NETWORK_NAME}. Aborting before modifying ${MAIN_APP}.
+Output: $VERIFY_DNS_OUTPUT
+The pgbouncer container IP works but its hostname does not resolve.
+Check: docker network inspect ${NETWORK_NAME}"
+    }
+    dokku_log_info1 "pgbouncer DNS resolution verified"
 
     # Store metadata so remove-intercept-db can undo everything
     dokku_log_info1 "Storing metadata on $BOUNCER_APP"
@@ -96,8 +109,6 @@ Check pgbouncer logs: dokku logs $BOUNCER_APP"
 
     SERVICE_UPPER=$(echo "$DB_SERVICE" | tr '[:lower:]-' '[:upper:]_')
     PREFIX="DOKKU_POSTGRES_${SERVICE_UPPER}_"
-    BOUNCER_HOST="${BOUNCER_APP}.web"
-    BOUNCER_PORT="6432"
 
     # Read env vars from the postgres container
     dokku_log_info1 "Reading postgres container env vars"
