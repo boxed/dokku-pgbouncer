@@ -75,30 +75,8 @@ case "$1" in
     dokku_log_info1 "Deploying pgbouncer image"
     dokku git:from-image "$BOUNCER_APP" pgbouncer/pgbouncer:latest || dokku_log_fail "Failed to deploy pgbouncer image"
 
-    # Verify pgbouncer can connect to postgres before touching the main app
     BOUNCER_PORT="6432"
-
-    dokku_log_info1 "Verifying pgbouncer can reach postgres"
-    BOUNCER_HOST_IP=$(docker inspect --format "{{(index .NetworkSettings.Networks \"${NETWORK_NAME}\").IPAddress}}" "${BOUNCER_APP}.web.1") \
-      || dokku_log_fail "Failed to get pgbouncer container IP on network $NETWORK_NAME"
-    [[ -z "$BOUNCER_HOST_IP" ]] && dokku_log_fail "Pgbouncer container has no IP on network $NETWORK_NAME"
-    VERIFY_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST_IP}:${BOUNCER_PORT}/${DB_NAME}" -c "SELECT 1" 2>&1) || {
-      dokku_log_fail "pgbouncer cannot connect to postgres. Aborting before modifying $MAIN_APP.
-Output: $VERIFY_OUTPUT
-Check pgbouncer logs: dokku logs $BOUNCER_APP"
-    }
-    dokku_log_info1 "pgbouncer connection verified via IP"
-
-    # Verify DNS resolution of the hostname the app will actually use
     BOUNCER_HOST="${BOUNCER_APP}.web"
-    dokku_log_info1 "Verifying DNS resolution of ${BOUNCER_HOST} on network ${NETWORK_NAME}"
-    VERIFY_DNS_OUTPUT=$(docker exec "dokku.postgres.${DB_SERVICE}" psql "postgres://${DB_USER}:${DB_PASSWORD}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}" -c "SELECT 1" 2>&1) || {
-      dokku_log_fail "DNS name ${BOUNCER_HOST} is not reachable from network ${NETWORK_NAME}. Aborting before modifying ${MAIN_APP}.
-Output: $VERIFY_DNS_OUTPUT
-The pgbouncer container IP works but its hostname does not resolve.
-Check: docker network inspect ${NETWORK_NAME}"
-    }
-    dokku_log_info1 "pgbouncer DNS resolution verified"
 
     # Store metadata so remove-intercept-db can undo everything
     dokku_log_info1 "Storing metadata on $BOUNCER_APP"
@@ -106,6 +84,29 @@ Check: docker network inspect ${NETWORK_NAME}"
       DOKKU_PGBOUNCER_DB_SERVICE="$DB_SERVICE" \
       DOKKU_PGBOUNCER_NETWORK="$NETWORK_NAME" \
       || dokku_log_fail "Failed to store metadata on $BOUNCER_APP"
+
+    # Set pgbouncer connection info on the main app (not DATABASE_URL yet)
+    # and rebuild so the app joins the network. This lets us verify
+    # connectivity from inside the app container before switching over.
+    dokku_log_info1 "Setting pgbouncer connection info on $MAIN_APP"
+    dokku config:set --no-restart "$MAIN_APP" \
+      PGBOUNCER_HOST="$BOUNCER_HOST" \
+      PGBOUNCER_PORT="$BOUNCER_PORT" \
+      || dokku_log_fail "Failed to set pgbouncer connection info on $MAIN_APP"
+
+    dokku_log_info1 "Rebuilding $MAIN_APP to join network"
+    dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
+
+    # Verify from inside the main app container that it can reach pgbouncer
+    dokku_log_info1 "Verifying pgbouncer connectivity from inside $MAIN_APP"
+    VERIFY_OUTPUT=$(docker exec "${MAIN_APP}.web.1" bash -c "echo 'SELECT 1;' | nc -w 3 \$PGBOUNCER_HOST \$PGBOUNCER_PORT" 2>&1) || {
+      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_HOST PGBOUNCER_PORT
+      dokku_log_fail "Cannot reach pgbouncer at ${BOUNCER_HOST}:${BOUNCER_PORT} from inside ${MAIN_APP}.
+Output: $VERIFY_OUTPUT
+The app's DNS cannot resolve the pgbouncer hostname. Aborting before modifying DATABASE_URL.
+Check: docker network inspect ${NETWORK_NAME}"
+    }
+    dokku_log_info1 "pgbouncer reachable from $MAIN_APP"
 
     SERVICE_UPPER=$(echo "$DB_SERVICE" | tr '[:lower:]-' '[:upper:]_')
     PREFIX="DOKKU_POSTGRES_${SERVICE_UPPER}_"
@@ -126,11 +127,10 @@ Check: docker network inspect ${NETWORK_NAME}"
 
     [[ -z "$PG_PASSWORD" ]] && dokku_log_fail "Failed to read POSTGRES_PASSWORD from postgres container"
 
-    # Unlink postgres so it stops owning the runtime vars
+    # Now do the actual switchover: unlink postgres, set pgbouncer as DATABASE_URL
     dokku_log_info1 "Unlinking postgres service $DB_SERVICE from $MAIN_APP"
     dokku postgres:unlink "$DB_SERVICE" "$MAIN_APP" -n || dokku_log_fail "Failed to unlink postgres service $DB_SERVICE from $MAIN_APP"
 
-    # Set all DOKKU_POSTGRES_* vars explicitly, with connectivity pointing to pgbouncer
     dokku_log_info1 "Updating $MAIN_APP to use pgbouncer"
     dokku config:set --no-restart "$MAIN_APP" \
       DATABASE_URL="postgres://${DB_USER}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME}" \
@@ -147,6 +147,9 @@ Check: docker network inspect ${NETWORK_NAME}"
       "${PREFIX}ENV_PGDATA=${PG_PGDATA}" \
       "${PREFIX}ENV_GOSU_VERSION=${PG_GOSU}" \
       || dokku_log_fail "Failed to set env vars on $MAIN_APP"
+
+    # Clean up the temporary verification vars
+    dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_HOST PGBOUNCER_PORT 2>/dev/null || true
 
     dokku_log_info1 "Rebuilding $MAIN_APP"
     dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
