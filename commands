@@ -45,7 +45,7 @@ case "$1" in
     # Create a shared network for the app, pgbouncer, and postgres
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
     dokku_log_info1 "Creating network: $NETWORK_NAME"
-    docker network create "$NETWORK_NAME" 2>/dev/null || dokku_log_info1 "Network $NETWORK_NAME already exists"
+    dokku network:create "$NETWORK_NAME" 2>/dev/null || dokku_log_info1 "Network $NETWORK_NAME already exists"
 
     dokku_log_info1 "Creating pgbouncer app: $BOUNCER_APP"
     dokku apps:create "$BOUNCER_APP" || dokku_log_fail "Failed to create app $BOUNCER_APP"
@@ -58,6 +58,9 @@ case "$1" in
     dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to $BOUNCER_APP"
 
     dokku_log_info1 "Attaching postgres service $DB_SERVICE to network"
+    # Set post-start-network so postgres rejoins the network on restart
+    dokku postgres:set "$DB_SERVICE" post-start-network "$NETWORK_NAME" || dokku_log_fail "Failed to set post-start-network on postgres service $DB_SERVICE"
+    # Also connect the running container immediately
     CONNECT_OUTPUT=$(docker network connect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" 2>&1) || {
       if echo "$CONNECT_OUTPUT" | grep -q "already exists"; then
         dokku_log_info1 "Postgres container already on network $NETWORK_NAME"
@@ -101,7 +104,7 @@ case "$1" in
 
     # Verify from inside the main app container that it can reach pgbouncer
     dokku_log_info1 "Verifying pgbouncer connectivity from inside $MAIN_APP"
-    VERIFY_OUTPUT=$(docker exec "${MAIN_APP}.web.1" bash -c "timeout 3 bash -c 'echo > /dev/tcp/${BOUNCER_HOST}/${BOUNCER_PORT}'" 2>&1) || {
+    VERIFY_OUTPUT=$(dokku enter "$MAIN_APP" web.1 bash -c "timeout 3 bash -c 'echo > /dev/tcp/${BOUNCER_HOST}/${BOUNCER_PORT}'" 2>&1) || {
       dokku_log_warn "Cannot reach pgbouncer at ${BOUNCER_HOST}:${BOUNCER_PORT} from inside ${MAIN_APP}."
       dokku_log_warn "Output: $VERIFY_OUTPUT"
       dokku_log_warn "The app is still running on its original DATABASE_URL (direct postgres)."
@@ -145,22 +148,11 @@ case "$1" in
       dokku_log_info1 "Pgbouncer app $BOUNCER_APP does not exist, skipping destroy"
     fi
 
-    if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
-      dokku_log_info1 "Removing network: $NETWORK_NAME"
+    dokku_log_info1 "Detaching postgres service $DB_SERVICE from network"
+    dokku postgres:set "$DB_SERVICE" post-start-network "" 2>/dev/null || true
 
-      for ATTEMPT in 1 2 3; do
-        CONNECTED=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}} {{end}}')
-        [[ -z "$CONNECTED" ]] && break
-        for CONTAINER in $CONNECTED; do
-          dokku_log_info1 "Disconnecting $CONTAINER from $NETWORK_NAME"
-          docker network disconnect -f "$NETWORK_NAME" "$CONTAINER" || dokku_log_warn "Warning: could not disconnect $CONTAINER from $NETWORK_NAME (likely already disconnected, this is safe to ignore)"
-        done
-      done
-
-      docker network rm "$NETWORK_NAME" || dokku_log_fail "Failed to remove docker network $NETWORK_NAME"
-    else
-      dokku_log_info1 "Network $NETWORK_NAME does not exist, skipping removal"
-    fi
+    dokku_log_info1 "Removing network: $NETWORK_NAME"
+    dokku network:destroy "$NETWORK_NAME" --force 2>/dev/null || dokku_log_info1 "Network $NETWORK_NAME does not exist or could not be removed"
 
     dokku_log_info1 "Done! $MAIN_APP is back on direct postgres"
     ;;
