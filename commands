@@ -6,7 +6,7 @@ source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
 PLUGIN_BASE_PATH="${PLUGIN_BASE_PATH:-/var/lib/dokku/plugins}"
 
 case "$1" in
-  pgbouncer:intercept-db)
+  pgbouncer:connect)
     [[ -z "$2" ]] && dokku_log_fail "Please specify a main app name"
     [[ -z "$3" ]] && dokku_log_fail "Please specify a postgres service name"
     MAIN_APP="$2"
@@ -117,7 +117,7 @@ case "$1" in
     dokku_log_info1 "The app should use PGBOUNCER_URL instead of DATABASE_URL for pooled connections"
     ;;
 
-  pgbouncer:remove-intercept-db)
+  pgbouncer:disconnect)
     [[ -z "$2" ]] && dokku_log_fail "Please specify a main app name"
     [[ -z "$3" ]] && dokku_log_fail "Please specify a postgres service name"
     MAIN_APP="$2"
@@ -169,8 +169,8 @@ case "$1" in
     help_content_func() {
       declare desc="return pgbouncer plugin help content"
       cat <<EOF
-    pgbouncer:intercept-db <app> <service>, Set up pgbouncer and publish PGBOUNCER_URL on the app
-    pgbouncer:remove-intercept-db <app> <service>, Remove pgbouncer and PGBOUNCER_URL from the app
+    pgbouncer:connect <app> <service>, Set up pgbouncer for a postgres service and publish PGBOUNCER_URL on the app
+    pgbouncer:disconnect <app> <service>, Remove pgbouncer and PGBOUNCER_URL from the app
     pgbouncer:info <app>, Show pgbouncer config for an app
 EOF
     }
