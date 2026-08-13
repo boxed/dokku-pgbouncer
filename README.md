@@ -39,7 +39,9 @@ This will:
 4. Verify the database is actually usable through pgbouncer — a real `SELECT 1` from a throwaway container — **before** touching your app
 5. Set `PGBOUNCER_URL`, `PGBOUNCER_HOST`, and `PGBOUNCER_PORT` on your app and restart it
 
-`DATABASE_URL` is left untouched — your app decides which connection to use, so make it prefer `PGBOUNCER_URL` when that variable is set. If anything fails, every change this command made is rolled back — the env vars, the network attachment, and the postgres service's `post-start-network` and network attachment — and the app keeps running on direct postgres. Interrupting the command with Ctrl-C rolls it back too.
+`DATABASE_URL` is left untouched — your app decides which connection to use, so make it prefer `PGBOUNCER_URL` when that variable is set. If anything fails, every change this command made is rolled back — the env vars, the network attachment, the postgres service's `post-start-network` and network attachment, and the configuration of an existing pgbouncer app it had already rewritten — and the app keeps running on direct postgres. Interrupting the command with Ctrl-C rolls it back too.
+
+Rolling back restarts your app whenever it was already pooled when the command started, because its running containers hold `PGBOUNCER_URL` in their environment: removing the variable moves the *next* deploy back to direct postgres, but not the containers that are serving traffic right now.
 
 A plain TCP check would not be enough here: pgbouncer accepts clients as soon as it starts listening and only dials postgres on the first query, so wrong credentials or an unreachable postgres would pass a port check and then break your app at query time.
 

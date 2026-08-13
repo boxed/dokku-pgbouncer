@@ -65,7 +65,13 @@ eq() { [[ "$1" == "$2" ]] || { echo "  expected '$2', got '$1'"; return 1; }; }
 gone() { [[ ! -e "$STATE/$1" ]] || { echo "  expected $1 to be gone"; return 1; }; }
 kept() { [[ -e "$STATE/$1" ]] || { echo "  expected $1 to still exist"; return 1; }; }
 has() { [[ "$1" == *"$2"* ]] || { echo "  expected to contain '$2'"; return 1; }; }
-not() { ! "$@"; }
+# Whole-line match against the call log, so 'ps:restart myapp' does not also
+# match 'ps:restart myapp-pgbouncer'.
+called() { grep -qxF "$1" "$CALLS" || { echo "  expected the call '$1'"; return 1; }; }
+times() { grep -cxF "$1" "$CALLS"; }
+# Swallows stdout: the diagnostics a helper prints when it "fails" are exactly
+# what is expected here.
+not() { ! "$@" >/dev/null; }
 hasnt() { [[ "$1" != *"$2"* ]] || { echo "  expected NOT to contain '$2'"; return 1; }; }
 
 # --- 1. happy path -----------------------------------------------------------
@@ -251,6 +257,35 @@ check "reports the probe output" has "$OUT" "connection to server"
 check "env vars rolled back" eq "$(cfg myapp PGBOUNCER_URL)" ""
 check "networks restored" eq "$(apc myapp)" "othernet"
 
+check "no needless restart of an app that was not pooled" not called "dokku ps:restart myapp"
+
+# A re-run over a *working* setup reconfigures and restarts the live pooler
+# before verifying it. Unsetting PGBOUNCER_URL is then not enough: the app's
+# containers still carry it, so they keep querying the pgbouncer that just
+# failed verification while dokku config says the app is on direct postgres.
+setup "a failed re-run takes the app and the pooler back"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/failverify"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'edoburu/pgbouncer:v1.25.2-p0' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_IMAGE"
+printf 'oldsecret' >"$STATE/cfg_myapp-pgbouncer_DB_PASSWORD"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+printf 'dokku.postgres.mydb\nmyapp.web.1\n' >"$STATE/netmembers_pgbouncer-myapp"
+printf 'myapp-pgbouncer.web' >"$STATE/cfg_myapp_PGBOUNCER_HOST"
+printf 'postgres://postgres:oldsecret@myapp-pgbouncer.web:6432/mydb' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+# A rotated password pgbouncer turns out not to be able to use.
+printf 'postgres://postgres:rotated456@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "url removed" eq "$(cfg myapp PGBOUNCER_URL)" ""
+check "app restarted so its containers follow the config" called "dokku ps:restart myapp"
+check "says the app is being moved back" has "$OUT" "drop back to direct postgres"
+check "pooler config restored" eq "$(cfg myapp-pgbouncer DB_PASSWORD)" "oldsecret"
+check "pooler restarted with the restored config" eq "$(times "dokku ps:restart myapp-pgbouncer")" "2"
+check "restored config not echoed" has "$(grep 'DB_PASSWORD=oldsecret' "$CALLS")" "dokku [quiet] config:set"
+
 setup "rollback when restart fails"
 printf 'othernet' >"$STATE/apc_myapp"
 touch "$STATE/net_othernet" "$STATE/fail_ps_restart_myapp"
@@ -406,6 +441,7 @@ touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/failveri
 printf 'true' >"$STATE/deployed_myapp-pgbouncer"
 printf 'otherdb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
 printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'dokku.postgres.otherdb' >"$STATE/cfg_myapp-pgbouncer_DB_HOST"
 printf 'pgbouncer-myapp' >"$STATE/psn_otherdb"
 printf 'postgres:16.2' >"$STATE/container_dokku.postgres.otherdb"
 printf 'dokku.postgres.otherdb\nmyapp.web.1\n' >"$STATE/netmembers_pgbouncer-myapp"
@@ -416,6 +452,11 @@ check "old service reclaimed" eq "$(psn otherdb)" "pgbouncer-myapp"
 check "old container reattached" has "$(members pgbouncer-myapp)" "dokku.postgres.otherdb"
 check "target service released" eq "$(psn mydb)" ""
 check "target container detached" hasnt "$(members pgbouncer-myapp)" "dokku.postgres.mydb"
+# The pooler's own record has to come back too: it is what disconnect acts on,
+# so leaving it naming the service the rollback just released would point the
+# teardown at the wrong postgres service.
+check "pooler still records the old service" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_DB_SERVICE)" "otherdb"
+check "pooler still points at the old host" eq "$(cfg myapp-pgbouncer DB_HOST)" "dokku.postgres.otherdb"
 
 # --- 16. service names dokku-postgres allows ---------------------------------
 # dokku-postgres builds the host with `tr ._ -`, so an underscore in the service

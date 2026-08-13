@@ -179,6 +179,15 @@ case "$1" in
     # Merge with any attach-post-create networks the app already has instead of clobbering them.
     ORIGINAL_MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
 
+    # Whether the app was already pooled when this run started. A re-run over a
+    # working setup reconfigures and restarts the live pgbouncer before the
+    # verification step, so a failure after that point has to restart the app
+    # even though this run never restarted it itself: its containers still carry
+    # the PGBOUNCER_URL they were created with, and would go on querying a
+    # pgbouncer that just failed verification. Unsetting the config alone leaves
+    # an outage behind while reporting that the app was left on direct postgres.
+    HAD_PGBOUNCER_URL=$(dokku config:get "$MAIN_APP" PGBOUNCER_URL 2>/dev/null || true)
+
     # Each flag records a mutation that the rollback helpers know how to undo.
     # They stay false when a step was already in the desired state, so a plain
     # re-run that fails undoes nothing it did not itself change.
@@ -188,6 +197,11 @@ case "$1" in
     PREVIOUS_CONTAINER_DETACHED=false
     NEW_PSN_SET=false
     NEW_CONTAINER_CONNECTED=false
+    BOUNCER_CONFIG_CHANGED=false
+    BOUNCER_RESTARTED=false
+    # Filled in from the pgbouncer app just before its config is rewritten.
+    BOUNCER_RESTORE_PAIRS=()
+    BOUNCER_RESTORE_UNSET=()
 
     # Undo everything this command published on the main app. Used on every
     # failure after this point so a half-applied setup is not left behind for
@@ -198,11 +212,40 @@ case "$1" in
         # shellcheck disable=SC2086
         dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS || dokku_log_warn "Failed to restore attach-post-create networks of $MAIN_APP"
       fi
-      # Only once the app has been restarted with PGBOUNCER_URL in its
-      # environment: unsetting the config alone would leave the running
-      # containers talking to a pgbouncer this run is abandoning.
-      if [[ "$MAIN_APP_RESTARTED" == "true" ]]; then
+      # Unsetting the config alone would leave the running containers talking to
+      # a pgbouncer this run is abandoning. That applies both when this run
+      # restarted the app with PGBOUNCER_URL in its environment and when the app
+      # arrived already pooled — in that case the containers were created with
+      # the URL long ago, and the pgbouncer they point at has since been
+      # reconfigured by this run.
+      if [[ "$MAIN_APP_RESTARTED" == "true" || -n "$HAD_PGBOUNCER_URL" ]]; then
+        dokku_log_info1 "Restarting $MAIN_APP so its containers drop back to direct postgres"
         dokku ps:restart "$MAIN_APP" || dokku_log_warn "Failed to restart $MAIN_APP during rollback; its containers may still be using PGBOUNCER_URL"
+      fi
+    }
+
+    # Put the pgbouncer app's own config back. Only meaningful when this run
+    # reconfigured an existing setup of ours: a fresh or adopted app has no
+    # previous configuration to return to. Without this, a failed re-run leaves
+    # the running pooler holding the values that just failed verification, and
+    # its DOKKU_PGBOUNCER_DB_SERVICE naming a service the rollback has released —
+    # which is the service a later pgbouncer:disconnect would act on.
+    rollback_bouncer_app() {
+      [[ "$BOUNCER_CONFIG_CHANGED" == "true" ]] || return 0
+      [[ ${#BOUNCER_RESTORE_PAIRS[@]} -gt 0 || ${#BOUNCER_RESTORE_UNSET[@]} -gt 0 ]] || return 0
+      dokku_log_info1 "Restoring the previous configuration of $BOUNCER_APP"
+      if [[ ${#BOUNCER_RESTORE_PAIRS[@]} -gt 0 ]]; then
+        quiet_dokku config:set --no-restart "$BOUNCER_APP" "${BOUNCER_RESTORE_PAIRS[@]}" ||
+          dokku_log_warn "Failed to restore the previous config of $BOUNCER_APP; it may still be configured for this failed run. Check: dokku pgbouncer:info $MAIN_APP"
+      fi
+      if [[ ${#BOUNCER_RESTORE_UNSET[@]} -gt 0 ]]; then
+        quiet_dokku config:unset --no-restart "$BOUNCER_APP" "${BOUNCER_RESTORE_UNSET[@]}" ||
+          dokku_log_warn "Failed to clear the config this run added to $BOUNCER_APP"
+      fi
+      # Only worth a restart if the container already picked the new values up;
+      # otherwise this would drop pooled connections for nothing.
+      if [[ "$BOUNCER_RESTARTED" == "true" ]]; then
+        dokku ps:restart "$BOUNCER_APP" || dokku_log_warn "Failed to restart $BOUNCER_APP with its previous configuration; it may still be running the config that failed verification"
       fi
     }
 
@@ -225,14 +268,17 @@ case "$1" in
     }
 
     # Every failure from here on leaves the main app as it was found, on direct
-    # postgres, and the postgres services as they were found. On a re-run over a
-    # working setup that means the app drops back to DATABASE_URL rather than
-    # keeping PGBOUNCER_URL pointed at a pgbouncer this run may have already
-    # half-reconfigured. Services are restored first so the app is restarted
-    # against a postgres that is reachable again.
+    # postgres, and the postgres services and the pgbouncer app's config as they
+    # were found. On a re-run over a working setup that means the app drops back
+    # to DATABASE_URL rather than keeping PGBOUNCER_URL pointed at a pgbouncer
+    # this run may have already half-reconfigured. Services are restored first,
+    # then the pooler's config, so that by the time the app is restarted both the
+    # postgres it talks to and the pgbouncer it may fall back to are reachable
+    # again.
     fail_and_rollback() {
       trap - INT TERM
       rollback_services
+      rollback_bouncer_app
       rollback_main_app
       dokku_log_fail "$1"
     }
@@ -322,7 +368,25 @@ case "$1" in
     # --no-restart throughout: the deploy step below decides whether the new
     # values are applied by a deploy or by an explicit restart. Letting
     # config:set restart as a side effect made that ordering invisible.
+    # Snapshot what this command owns on a pgbouncer app it configured before,
+    # so rollback_bouncer_app can put the live pooler back. Read before the
+    # rewrite below, and only for an app with our marker on it: for a fresh or
+    # adopted app these keys have no previous values to keep.
+    if [[ -n "$PREVIOUS_SERVICE" ]]; then
+      for owned_var in "${PGBOUNCER_OWNED_VARS[@]}"; do
+        owned_value=$(dokku config:get "$BOUNCER_APP" "$owned_var" 2>/dev/null || true)
+        if [[ -n "$owned_value" ]]; then
+          BOUNCER_RESTORE_PAIRS+=("${owned_var}=${owned_value}")
+        else
+          BOUNCER_RESTORE_UNSET+=("$owned_var")
+        fi
+      done
+    fi
+
     dokku_log_info1 "Setting pgbouncer config"
+    # Set before the call, not after: a config:set that fails part way through
+    # has still changed something the rollback needs to put back.
+    BOUNCER_CONFIG_CHANGED=true
     quiet_dokku config:set --no-restart "$BOUNCER_APP" \
       DB_HOST="dokku.postgres.${DB_SERVICE}" \
       DB_USER="$DB_USER" \
@@ -371,6 +435,9 @@ case "$1" in
 
     BOUNCER_DEPLOYED=$(dokku ps:report "$BOUNCER_APP" --deployed 2>/dev/null) || BOUNCER_DEPLOYED="unknown"
     DEPLOYED_IMAGE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_IMAGE 2>/dev/null || true)
+    # Either branch below hands the config set above to a running container, so
+    # from here a rollback has to restart the pooler as well as reset its config.
+    BOUNCER_RESTARTED=true
     if [[ "$BOUNCER_DEPLOYED" == "true" && "$DEPLOYED_IMAGE" == "$PGBOUNCER_IMAGE" ]]; then
       dokku_log_info1 "$BOUNCER_APP already runs $PGBOUNCER_IMAGE, restarting it with the current config"
       dokku ps:restart "$BOUNCER_APP" || fail_and_rollback "Failed to restart $BOUNCER_APP"
@@ -431,7 +498,7 @@ case "$1" in
     if [[ "$VERIFY_OK" != "true" ]]; then
       dokku_log_warn "Cannot query the database through pgbouncer at ${BOUNCER_HOST}:${BOUNCER_PORT} on network ${NETWORK_NAME}."
       dokku_log_warn "Output: $VERIFY_OUTPUT"
-      dokku_log_warn "$MAIN_APP is being left on DATABASE_URL (direct postgres)."
+      dokku_log_warn "$MAIN_APP will be left running on DATABASE_URL (direct postgres)."
       dokku_log_warn "Check: dokku logs $BOUNCER_APP, docker network inspect ${NETWORK_NAME}"
       fail_and_rollback "Pgbouncer verification failed"
     fi

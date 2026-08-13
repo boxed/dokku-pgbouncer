@@ -48,6 +48,22 @@ PGBOUNCER_TUNING_DEFAULTS=(
   "DEFAULT_POOL_SIZE=20"
 )
 
+# The keys 'pgbouncer:connect' owns on the pgbouncer app. It rewrites every one
+# of them on each run, so they are also exactly what a rollback has to put back
+# to leave a pooler it reconfigured the way it found it.
+PGBOUNCER_OWNED_VARS=(
+  DB_HOST
+  DB_USER
+  DB_PASSWORD
+  DB_PORT
+  DB_NAME
+  LISTEN_PORT
+  AUTH_TYPE
+  ADMIN_USERS
+  DOKKU_PGBOUNCER_DB_SERVICE
+  DOKKU_PGBOUNCER_NETWORK
+)
+
 # Left behind by versions of this plugin that ran pgbouncer/pgbouncer. They are
 # inert under the current image, but DATABASES_PASSWORD is a plaintext password
 # sitting in 'dokku config:show' forever, so connect clears them.
