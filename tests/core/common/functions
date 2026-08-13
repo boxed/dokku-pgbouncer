@@ -1,0 +1,9 @@
+# Minimal stand-in for dokku's common/functions used by the plugin.
+dokku_log_info1() { echo "-----> $*"; }
+dokku_log_info2() { echo "=====> $*"; }
+dokku_log_warn() { echo " !     $*" >&2; }
+dokku_log_fail() {
+  echo " !     $*" >&2
+  exit 1
+}
+DOKKU_NOT_IMPLEMENTED_EXIT=10

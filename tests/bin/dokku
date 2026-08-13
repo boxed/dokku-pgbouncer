@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Stub for the dokku CLI. State lives as files under $STATE; every call is
+# appended to $CALLS so tests can assert on the sequence.
+set -uo pipefail
+echo "dokku $*" >>"$CALLS"
+
+key() { printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '_'; }
+
+fail_if_marked() {
+  [[ -e "$STATE/fail_$(key "$1")" ]] && {
+    echo "stub: forced failure of $1" >&2
+    exit 1
+  }
+  return 0
+}
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+  config:get)
+    app="$1" k="$2"
+    [[ -e "$STATE/app_$(key "$app")" ]] || {
+      echo "App $app does not exist" >&2
+      exit 1
+    }
+    f="$STATE/cfg_$(key "$app")_$(key "$k")"
+    [[ -e "$f" ]] && cat "$f"
+    ;;
+  config:set)
+    args=()
+    for a in "$@"; do [[ "$a" == --* ]] || args+=("$a"); done
+    app="${args[0]}"
+    fail_if_marked "config:set_$app"
+    for pair in "${args[@]:1}"; do
+      printf '%s' "${pair#*=}" >"$STATE/cfg_$(key "$app")_$(key "${pair%%=*}")"
+    done
+    ;;
+  config:unset)
+    args=()
+    for a in "$@"; do [[ "$a" == --* ]] || args+=("$a"); done
+    app="${args[0]}"
+    fail_if_marked "config:unset_$app"
+    for k in "${args[@]:1}"; do rm -f "$STATE/cfg_$(key "$app")_$(key "$k")"; done
+    ;;
+  config:show)
+    app="$1"
+    [[ -e "$STATE/app_$(key "$app")" ]] || exit 1
+    for f in "$STATE/cfg_$(key "$app")_"*; do
+      [[ -e "$f" ]] || continue
+      n="${f##*/cfg_"$(key "$app")"_}"
+      echo "$n:  $(cat "$f")"
+    done
+    ;;
+  apps:exists) [[ -e "$STATE/app_$(key "$1")" ]] ;;
+  apps:create)
+    fail_if_marked "apps:create_$1"
+    touch "$STATE/app_$(key "$1")"
+    ;;
+  apps:destroy)
+    fail_if_marked "apps:destroy_$1"
+    rm -f "$STATE/app_$(key "$1")" "$STATE/cfg_$(key "$1")_"*
+    ;;
+  ps:report)
+    f="$STATE/deployed_$(key "$1")"
+    if [[ -e "$f" ]]; then cat "$f"; else exit 1; fi
+    ;;
+  ps:rebuild)
+    fail_if_marked "ps:rebuild_$1"
+    # Mimic attach-post-create: containers are recreated on exactly the
+    # networks currently listed for the app, and nothing else.
+    app="$1" c="$1.web.1"
+    for f in "$STATE"/netmembers_*; do
+      [[ -e "$f" ]] || continue
+      grep -vxF "$c" "$f" >"$f.new" || true
+      mv "$f.new" "$f"
+    done
+    # $STATE/nojoin simulates dokku failing to attach the new containers.
+    [[ -e "$STATE/nojoin" ]] && exit 0
+    for net in $(cat "$STATE/apc_$(key "$app")" 2>/dev/null || true); do
+      echo "$c" >>"$STATE/netmembers_$(key "$net")"
+    done
+    ;;
+  proxy:disable) fail_if_marked "proxy:disable_$1" ;;
+  git:from-image) fail_if_marked "git:from-image_$1" ;;
+  network:exists) [[ -e "$STATE/net_$(key "$1")" ]] ;;
+  network:create)
+    fail_if_marked "network:create_$1"
+    touch "$STATE/net_$(key "$1")"
+    ;;
+  network:destroy)
+    fail_if_marked "network:destroy_$1"
+    rm -f "$STATE/net_$(key "$1")"
+    ;;
+  network:report)
+    f="$STATE/apc_$(key "$1")"
+    [[ -e "$f" ]] && cat "$f"
+    ;;
+  network:set)
+    app="$1"
+    fail_if_marked "network:set_$app"
+    shift 2 # app, property
+    printf '%s' "$*" >"$STATE/apc_$(key "$app")"
+    ;;
+  postgres:info)
+    svc="$1"
+    f="$STATE/psn_$(key "$svc")"
+    [[ -e "$STATE/pgfail_$(key "$svc")" ]] && exit 1
+    # An unset property prints nothing and still succeeds, like real dokku.
+    [[ -e "$f" ]] && cat "$f"
+    exit 0
+    ;;
+  postgres:set)
+    svc="$1"
+    fail_if_marked "postgres:set_$svc"
+    printf '%s' "${3:-}" >"$STATE/psn_$(key "$svc")"
+    ;;
+  *)
+    echo "stub dokku: unhandled command '$cmd $*'" >&2
+    exit 1
+    ;;
+esac

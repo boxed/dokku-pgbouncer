@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Stub for the docker CLI. Containers: $STATE/container_<name> holds its image.
+# Membership: $STATE/netmembers_<net> lists container names, one per line.
+# A container listed in $STATE/stopped_<name> is excluded from
+# 'docker network inspect' output but keeps its endpoint, like real docker.
+set -uo pipefail
+echo "docker $*" >>"$CALLS"
+
+key() { printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '_'; }
+
+networks_of() {
+  local name="$1" f net
+  for f in "$STATE"/netmembers_*; do
+    [[ -e "$f" ]] || continue
+    net="${f##*/netmembers_}"
+    grep -qxF "$name" "$f" && echo "$net"
+  done
+  return 0
+}
+
+case "$1" in
+  inspect)
+    shift
+    fmt="" name=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --format) fmt="$2"; shift 2 ;;
+        --format=*) fmt="${1#--format=}"; shift ;;
+        *) name="$1"; shift ;;
+      esac
+    done
+    [[ -e "$STATE/container_$(key "$name")" ]] || {
+      echo "Error: No such object: $name" >&2
+      exit 1
+    }
+    case "$fmt" in
+      *.Id*) echo "cafebabe0001" ;;
+      *.Config.Image*) cat "$STATE/container_$(key "$name")" ;;
+      *NetworkSettings.Networks*) networks_of "$name" ;;
+      *) echo "stub docker: unhandled inspect format '$fmt'" >&2; exit 1 ;;
+    esac
+    ;;
+  image)
+    case "$2" in
+      inspect) [[ -e "$STATE/image_$(key "$3")" ]] ;;
+      *) echo "stub docker: unhandled 'image $2'" >&2; exit 1 ;;
+    esac
+    ;;
+  pull)
+    [[ -e "$STATE/failpull" ]] && exit 1
+    touch "$STATE/image_$(key "$2")"
+    ;;
+  network)
+    sub="$2"
+    shift 2
+    case "$sub" in
+      inspect)
+        net="" fmt=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --format) fmt="$2"; shift 2 ;;
+            --format=*) fmt="${1#--format=}"; shift ;;
+            *) net="$1"; shift ;;
+          esac
+        done
+        [[ -e "$STATE/net_$(key "$net")" ]] || {
+          echo "Error: No such network: $net" >&2
+          exit 1
+        }
+        f="$STATE/netmembers_$(key "$net")"
+        [[ -e "$f" ]] || exit 0
+        while read -r c; do
+          [[ -n "$c" ]] || continue
+          [[ -e "$STATE/stopped_$(key "$c")" ]] && continue
+          echo "$c"
+        done <"$f"
+        ;;
+      connect)
+        net="$1" c="$2"
+        f="$STATE/netmembers_$(key "$net")"
+        if [[ -e "$f" ]] && grep -qxF "$c" "$f"; then
+          echo "Error response from daemon: endpoint with name $c already exists in network $net" >&2
+          exit 1
+        fi
+        echo "$c" >>"$f"
+        ;;
+      disconnect)
+        net="$1" c="$2"
+        f="$STATE/netmembers_$(key "$net")"
+        if [[ -e "$f" ]]; then
+          grep -vxF "$c" "$f" >"$f.new" || true
+          mv "$f.new" "$f"
+        fi
+        ;;
+      *) echo "stub docker: unhandled 'network $sub'" >&2; exit 1 ;;
+    esac
+    ;;
+  run)
+    # Only used for the psql probe.
+    if [[ -e "$STATE/failverify" ]]; then
+      echo "psql: error: connection to server at \"stub\" failed" >&2
+      exit 2
+    fi
+    echo "1"
+    ;;
+  *)
+    echo "stub docker: unhandled command '$*'" >&2
+    exit 1
+    ;;
+esac
