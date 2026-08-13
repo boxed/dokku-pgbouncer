@@ -869,6 +869,31 @@ check "port dropped" eq "$(cfg clone PGBOUNCER_PORT)" ""
 check "off the source app's private network" eq "$(apc clone)" "othernet"
 check "unset quietly" has "$(cat "$CALLS")" "dokku [quiet] config:unset"
 
+# Only an app that owns a pooler names it as '<itself>-pgbouncer'; a clone always
+# inherits some other app's. So this is the signature of a hook that has not been
+# handed (source, clone), and stripping the variables would break a working app.
+setup "clone hook leaves an app that owns its pgbouncer alone"
+touch "$STATE/app_clone" "$STATE/app_myapp-pgbouncer"
+printf 'myapp-pgbouncer.web' >"$STATE/cfg_myapp_PGBOUNCER_HOST"
+printf 'postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run_hook post-app-clone-setup clone myapp
+check "exits 0" eq "$RC" "0"
+check "says why" has "$OUT" "does not look like an inherited setup"
+check "url kept" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb"
+check "network kept" eq "$(apc myapp)" "pgbouncer-myapp"
+
+# The hook reads the clone's copy of the config, which dokku's config plugin
+# makes first only because 'pgbouncer' sorts after 'config'.
+setup "clone hook speaks up when the clone has no config yet"
+touch "$STATE/app_clone" "$STATE/app_myapp-pgbouncer"
+printf 'myapp-pgbouncer.web' >"$STATE/cfg_myapp_PGBOUNCER_HOST"
+printf 'othernet' >"$STATE/apc_clone"
+run_hook post-app-clone-setup myapp clone
+check "exits 0" eq "$RC" "0"
+check "warns" has "$OUT" "has not been given its copy of the config"
+check "networks untouched" eq "$(apc clone)" "othernet"
+
 setup "clone of an app without pgbouncer is a no-op"
 touch "$STATE/app_clone"
 printf 'othernet' >"$STATE/apc_clone"

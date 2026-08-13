@@ -12,12 +12,40 @@ set -eo pipefail
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
 
+SOURCE_APP="${1:-}"
 NEW_APP="${2:-}"
 [[ -z "$NEW_APP" ]] && exit 0
 
 STORED_HOST=$(dokku config:get "$NEW_APP" PGBOUNCER_HOST 2>/dev/null || true)
-[[ -z "$STORED_HOST" ]] && exit 0
+
+# What this hook reads is the *clone's* copy of the config, which exists only
+# once dokku's own config plugin has made it. plugn runs each trigger in plugin
+# name order, so that holds while this plugin is installed as 'pgbouncer' (or any
+# name sorting after 'config' and 'network'), which is what the install command
+# in the README does. Installed under an earlier name it would run first, find
+# nothing, and leave the clone wired to another app's pooler — so if the source
+# app has pgbouncer and the clone has no config yet, say so instead of exiting
+# quietly.
+if [[ -z "$STORED_HOST" ]]; then
+  SOURCE_HOST=""
+  [[ -n "$SOURCE_APP" ]] && SOURCE_HOST=$(dokku config:get "$SOURCE_APP" PGBOUNCER_HOST 2>/dev/null || true)
+  if [[ -n "$SOURCE_HOST" ]]; then
+    dokku_log_warn "$SOURCE_APP routes through pgbouncer, but $NEW_APP has not been given its copy of the config yet, so the inherited PGBOUNCER_* variables cannot be removed here."
+    dokku_log_warn "Is this plugin installed under a name that sorts before dokku's own 'config' plugin? Check $NEW_APP before deploying it: dokku config:show $NEW_APP"
+  fi
+  exit 0
+fi
+
 SOURCE_BOUNCER_APP="${STORED_HOST%.web}"
+
+# A clone inherits the *source* app's pgbouncer host, so this can only name the
+# app in hand if that app owns the pooler rather than having inherited it — i.e.
+# these are not (source, clone). Stripping the variables then would take a
+# working app off its own pooler, so leave it alone.
+if [[ "$SOURCE_BOUNCER_APP" == "${NEW_APP}-pgbouncer" ]]; then
+  dokku_log_warn "$NEW_APP records '$SOURCE_BOUNCER_APP' as its own pgbouncer app, so this does not look like an inherited setup; leaving it alone"
+  exit 0
+fi
 
 dokku_log_info1 "Removing the inherited pgbouncer connection from $NEW_APP; it belongs to $SOURCE_BOUNCER_APP"
 quiet_dokku config:unset --no-restart "$NEW_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT ||
