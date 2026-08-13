@@ -329,8 +329,19 @@ case "$1" in
       MAIN_APP_NETWORK_ADDED=true
     fi
 
-    dokku_log_info1 "Attaching network to $BOUNCER_APP"
-    dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME" || fail_and_rollback "Failed to attach network to $BOUNCER_APP"
+    # Merged rather than overwritten, for the same reason as the main app above:
+    # an operator may have put the pooler on another network of their own, and a
+    # re-run of connect must not silently take it off again.
+    BOUNCER_NETWORKS=$(dokku network:report "$BOUNCER_APP" --network-attach-post-create) ||
+      fail_and_rollback "Failed to read attach-post-create networks of $BOUNCER_APP"
+    if [[ " $BOUNCER_NETWORKS " == *" $NETWORK_NAME "* ]]; then
+      dokku_log_info1 "$BOUNCER_APP already set to attach to $NETWORK_NAME"
+    else
+      dokku_log_info1 "Attaching network to $BOUNCER_APP"
+      # shellcheck disable=SC2086
+      dokku network:set "$BOUNCER_APP" attach-post-create $BOUNCER_NETWORKS "$NETWORK_NAME" ||
+        fail_and_rollback "Failed to attach network to $BOUNCER_APP"
+    fi
 
     dokku_log_info1 "Attaching postgres service $DB_SERVICE to network"
     # Set post-start-network so postgres rejoins the network on restart. Already

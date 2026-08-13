@@ -223,6 +223,19 @@ check "refuses to overwrite" has "$OUT" "Refusing to overwrite"
 check "foreign config intact" eq "$(cfg myapp-pgbouncer IMPORTANT)" "someone-elses-secret"
 check "no image deployed over it" hasnt "$(cat "$CALLS")" "git:from-image"
 
+# The pgbouncer app's own networks are merged too: an operator may have attached
+# it to a network of their own, and a re-run must not take it off again.
+setup "connect keeps the other networks of the pgbouncer app"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_monitoring"
+printf 'false' >"$STATE/deployed_myapp-pgbouncer"
+printf 'monitoring' >"$STATE/apc_myapp-pgbouncer"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "both networks kept" eq "$(apc myapp-pgbouncer)" "monitoring pgbouncer-myapp"
+run pgbouncer:connect myapp mydb
+check "re-run exits 0" eq "$RC" "0"
+check "no duplicate on a re-run" eq "$(apc myapp-pgbouncer)" "monitoring pgbouncer-myapp"
+
 setup "adopt empty app"
 touch "$STATE/app_myapp-pgbouncer"
 printf 'false' >"$STATE/deployed_myapp-pgbouncer"

@@ -119,8 +119,15 @@ case "$cmd" in
     rm -f "$STATE/net_$(key "$1")"
     ;;
   network:report)
+    # Real dokku only fails here for an app that does not exist; an app with the
+    # property unset prints nothing and succeeds.
+    [[ -e "$STATE/app_$(key "$1")" ]] || {
+      echo "App $1 does not exist" >&2
+      exit 1
+    }
     f="$STATE/apc_$(key "$1")"
     [[ -e "$f" ]] && cat "$f"
+    exit 0
     ;;
   network:set)
     app="$1"
