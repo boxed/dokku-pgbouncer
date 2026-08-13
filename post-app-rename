@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Dokku calls this after an app is renamed.
+#
+# Every name this plugin uses is derived from the app name: the pgbouncer app
+# (<app>-pgbouncer), the shared network (pgbouncer-<app>), and PGBOUNCER_URL's
+# host (<app>-pgbouncer.web). A rename leaves all of them pointing at the old
+# name, so the setup keeps working but 'pgbouncer:disconnect <new-name>' no
+# longer finds anything to clean up.
+#
+# Renaming them here is not safe to do behind the operator's back — it means
+# destroying and redeploying the pgbouncer app, which drops every pooled
+# connection — so make the mismatch loud instead of silent.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+
+# Argument order has varied across dokku versions; the app that still exists is
+# the new one either way.
+for candidate in "${1:-}" "${2:-}"; do
+  [[ -z "$candidate" ]] && continue
+  if dokku apps:exists "$candidate" >/dev/null 2>&1; then
+    NEW_APP="$candidate"
+  else
+    OLD_APP="$candidate"
+  fi
+done
+[[ -z "${OLD_APP:-}" || -z "${NEW_APP:-}" ]] && exit 0
+
+OLD_BOUNCER_APP="${OLD_APP}-pgbouncer"
+DB_SERVICE=$(dokku config:get "$OLD_BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+[[ -z "$DB_SERVICE" ]] && exit 0
+
+dokku_log_warn "$NEW_APP still uses the pgbouncer app '$OLD_BOUNCER_APP' and network 'pgbouncer-${OLD_APP}', both named after '$OLD_APP'."
+dokku_log_warn "Pooling keeps working and disconnect still finds them, but to bring the names back in line:"
+dokku_log_warn "  dokku pgbouncer:disconnect $NEW_APP"
+dokku_log_warn "  dokku pgbouncer:connect $NEW_APP $DB_SERVICE"
+exit 0

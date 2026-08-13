@@ -32,6 +32,13 @@ run() {
   return 0
 }
 
+# Runs a dokku trigger hook (post-delete, post-app-rename) the way dokku would.
+run_hook() {
+  OUT=$("$ROOT/$1" "${@:2}" 2>&1)
+  RC=$?
+  return 0
+}
+
 check() {
   local what="$1"
   shift
@@ -187,9 +194,9 @@ check "reports the probe output" has "$OUT" "connection to server"
 check "env vars rolled back" eq "$(cfg myapp PGBOUNCER_URL)" ""
 check "networks restored" eq "$(apc myapp)" "othernet"
 
-setup "rollback when rebuild fails"
+setup "rollback when restart fails"
 printf 'othernet' >"$STATE/apc_myapp"
-touch "$STATE/net_othernet" "$STATE/fail_ps_rebuild_myapp"
+touch "$STATE/net_othernet" "$STATE/fail_ps_restart_myapp"
 run pgbouncer:connect myapp mydb
 check "fails" eq "$RC" "1"
 check "env vars rolled back" eq "$(cfg myapp PGBOUNCER_URL)" ""
@@ -300,6 +307,162 @@ check "fails" eq "$RC" "1"
 check "asks for service" has "$OUT" "specify a postgres service name"
 run pgbouncer:nonsense
 check "not-implemented exit" eq "$RC" "10"
+
+# --- 15. a taken target service must not disturb the working setup -----------
+# The conflict check has to run before the previous service is released:
+# otherwise naming a taken service tears down this app's working pgbouncer and
+# only then aborts.
+setup "repointing onto a taken service leaves everything alone"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'otherdb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_otherdb"        # the working setup
+printf 'pgbouncer-otherapp' >"$STATE/psn_mydb"        # target is already taken
+printf 'postgres:16.2' >"$STATE/container_dokku.postgres.otherdb"
+printf 'dokku.postgres.otherdb\nmyapp.web.1\n' >"$STATE/netmembers_pgbouncer-myapp"
+printf 'postgres://postgres:secret123@myapp-pgbouncer.web:6432/otherdb' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "explains the conflict" has "$OUT" "can only back one pgbouncer"
+check "old service still claimed" eq "$(psn otherdb)" "pgbouncer-myapp"
+check "old container still attached" has "$(members pgbouncer-myapp)" "dokku.postgres.otherdb"
+check "did not touch the target" eq "$(psn mydb)" "pgbouncer-otherapp"
+check "working url intact" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/otherdb"
+check "networks intact" eq "$(apc myapp)" "pgbouncer-myapp"
+check "did not detach anything" hasnt "$(cat "$CALLS")" "docker network disconnect"
+
+# A failure *after* the detach has to put the previous service back.
+setup "rollback restores the previously connected service"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/failverify"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'otherdb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_otherdb"
+printf 'postgres:16.2' >"$STATE/container_dokku.postgres.otherdb"
+printf 'dokku.postgres.otherdb\nmyapp.web.1\n' >"$STATE/netmembers_pgbouncer-myapp"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "old service reclaimed" eq "$(psn otherdb)" "pgbouncer-myapp"
+check "old container reattached" has "$(members pgbouncer-myapp)" "dokku.postgres.otherdb"
+check "target service released" eq "$(psn mydb)" ""
+check "target container detached" hasnt "$(members pgbouncer-myapp)" "dokku.postgres.mydb"
+
+# --- 16. service names dokku-postgres allows ---------------------------------
+# dokku-postgres builds the host with `tr ._ -`, so an underscore in the service
+# name becomes a dash in DATABASE_URL. Underscores are legal in service names.
+setup "service name containing an underscore"
+printf 'postgres://postgres:secret123@dokku-postgres-my-db:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+printf 'postgres:16.2' >"$STATE/container_dokku.postgres.my_db"
+run pgbouncer:connect myapp my_db
+check "exits 0" eq "$RC" "0"
+check "no mismatch complaint" hasnt "$OUT" "different postgres service"
+check "no mismatch warning" hasnt "$OUT" "does not look like"
+check "host points at the service" eq "$(cfg myapp-pgbouncer DATABASES_HOST)" "dokku.postgres.my_db"
+
+# The container-name form of the host has to fail hard on a mismatch too, or the
+# guard only catches whichever spelling it happens to recognise.
+setup "wrong service argument, container-name host form"
+printf 'postgres://postgres:secret123@dokku.postgres.otherdb:5432/otherdb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "explains mismatch" has "$OUT" "different postgres service"
+check "app untouched" eq "$(cfg myapp PGBOUNCER_URL)" ""
+
+# --- 17. port validation ----------------------------------------------------
+setup "non-numeric port"
+printf 'postgres://postgres:secret123@dokku-postgres-mydb:54 32/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "names the problem" has "$OUT" "non-numeric port"
+check "nothing configured" eq "$(cfg myapp-pgbouncer DATABASES_PORT)" ""
+
+# --- 18. disconnect finishes the teardown even if the app cannot restart -----
+setup "disconnect continues when the app cannot restart"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/fail_ps_restart_myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'x' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+run pgbouncer:disconnect myapp
+check "exits 0" eq "$RC" "0"
+check "warns about the restart" has "$OUT" "Failed to restart myapp"
+check "url removed" eq "$(cfg myapp PGBOUNCER_URL)" ""
+check "service released" eq "$(psn mydb)" ""
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "network destroyed" gone "net_pgbouncer-myapp"
+
+setup "disconnect after the app was destroyed by hand"
+rm -f "$STATE/app_myapp"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+run pgbouncer:disconnect myapp
+check "exits 0" eq "$RC" "0"
+check "says so" has "$OUT" "only tearing down the pgbouncer side"
+check "service released" eq "$(psn mydb)" ""
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "network destroyed" gone "net_pgbouncer-myapp"
+
+# --- 19. disconnect after apps:rename ---------------------------------------
+# Every name is derived from the app name, but PGBOUNCER_HOST recorded on the
+# app itself survives the rename and still points at the real bouncer app.
+setup "disconnect finds the bouncer app of a renamed app"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'x' >"$STATE/cfg_newname_PGBOUNCER_URL"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-oldname' >"$STATE/apc_newname"
+printf 'pgbouncer-oldname' >"$STATE/psn_mydb"
+run pgbouncer:disconnect newname
+check "exits 0" eq "$RC" "0"
+check "notices the rename" has "$OUT" "records its pgbouncer as 'oldname-pgbouncer'"
+check "url removed" eq "$(cfg newname PGBOUNCER_URL)" ""
+check "network detached" eq "$(apc newname)" ""
+check "old bouncer destroyed" gone "app_oldname-pgbouncer"
+check "old network destroyed" gone "net_pgbouncer-oldname"
+check "service released" eq "$(psn mydb)" ""
+
+# --- 20. post-delete cleans up after apps:destroy ---------------------------
+setup "post-delete releases everything the app left behind"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'dokku.postgres.mydb\n' >"$STATE/netmembers_pgbouncer-myapp"
+rm -f "$STATE/app_myapp" # dokku has already destroyed it
+run_hook post-delete myapp
+check "exits 0" eq "$RC" "0"
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+check "container detached" hasnt "$(members pgbouncer-myapp)" "dokku.postgres.mydb"
+check "network destroyed" gone "net_pgbouncer-myapp"
+
+setup "post-delete ignores apps this plugin does not own"
+touch "$STATE/app_myapp-pgbouncer"
+printf 'someone-elses-secret' >"$STATE/cfg_myapp-pgbouncer_IMPORTANT"
+run_hook post-delete myapp
+check "exits 0" eq "$RC" "0"
+check "foreign app kept" kept "app_myapp-pgbouncer"
+check "foreign config intact" eq "$(cfg myapp-pgbouncer IMPORTANT)" "someone-elses-secret"
+
+# Destroying our own bouncer app must not make the hook recurse.
+setup "post-delete is a no-op for the bouncer app itself"
+run_hook post-delete myapp-pgbouncer
+check "exits 0" eq "$RC" "0"
+check "did nothing" eq "$(cat "$CALLS")" "dokku config:get myapp-pgbouncer-pgbouncer DOKKU_PGBOUNCER_DB_SERVICE"
+
+# --- 21. bare command shows usage -------------------------------------------
+setup "bare pgbouncer command"
+run pgbouncer
+check "exits 0" eq "$RC" "0"
+check "shows usage" has "$OUT" "Usage: dokku pgbouncer"
+check "lists connect" has "$OUT" "pgbouncer:connect"
 
 echo
 echo "passed: $PASS   failed: $FAIL"

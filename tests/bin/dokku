@@ -65,8 +65,8 @@ case "$cmd" in
     f="$STATE/deployed_$(key "$1")"
     if [[ -e "$f" ]]; then cat "$f"; else exit 1; fi
     ;;
-  ps:rebuild)
-    fail_if_marked "ps:rebuild_$1"
+  ps:restart)
+    fail_if_marked "ps:restart_$1"
     # Mimic attach-post-create: containers are recreated on exactly the
     # networks currently listed for the app, and nothing else.
     app="$1" c="$1.web.1"

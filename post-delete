@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Dokku calls this after an app is destroyed.
+#
+# 'pgbouncer:disconnect' cannot be reused here: it needs the app to still
+# exist. Without this hook, 'dokku apps:destroy <app>' orphans the pgbouncer
+# app and the shared network, and — worst — leaves the postgres service's
+# post-start-network pointing at a network nobody uses. That property is
+# single-valued, so the service is then permanently barred from backing another
+# pgbouncer, with no command left that would clean it up.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
+
+APP="${1:-}"
+[[ -z "$APP" ]] && exit 0
+BOUNCER_APP="${APP}-pgbouncer"
+
+# The marker is the only proof this plugin owns that app, exactly as in
+# pgbouncer:disconnect. Reading it before anything is destroyed also makes the
+# hook a no-op when dokku is destroying a pgbouncer app of ours (there is no
+# <app>-pgbouncer-pgbouncer), so tearing one down cannot recurse.
+DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+[[ -z "$DB_SERVICE" ]] && exit 0
+NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+[[ -z "$NETWORK_NAME" ]] && NETWORK_NAME="pgbouncer-${APP}"
+
+dokku_log_info1 "Cleaning up the pgbouncer setup left behind by $APP"
+
+dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
+dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_warn "Failed to destroy $BOUNCER_APP; remove it by hand: dokku apps:destroy $BOUNCER_APP"
+
+# Only clear post-start-network if it is still ours; it may have been repointed
+# at another app's pgbouncer since connect.
+CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
+  CURRENT_PSN=""
+  dokku_log_warn "Could not read post-start-network of $DB_SERVICE, leaving it alone"
+}
+if [[ "$CURRENT_PSN" == "$NETWORK_NAME" ]]; then
+  dokku_log_info1 "Releasing postgres service $DB_SERVICE"
+  dokku postgres:set "$DB_SERVICE" post-start-network "" || dokku_log_warn "Failed to clear post-start-network on $DB_SERVICE; it will refuse to back another pgbouncer until you run: dokku postgres:set $DB_SERVICE post-start-network \"\""
+elif [[ -n "$CURRENT_PSN" ]]; then
+  dokku_log_info1 "post-start-network of $DB_SERVICE is '$CURRENT_PSN', not $NETWORK_NAME; leaving it alone"
+fi
+
+if dokku network:exists "$NETWORK_NAME" >/dev/null 2>&1; then
+  # A stopped container keeps its endpoint, which still blocks network:destroy.
+  if container_on_network "dokku.postgres.${DB_SERVICE}" "$NETWORK_NAME"; then
+    docker network disconnect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" || dokku_log_warn "Failed to disconnect postgres container from $NETWORK_NAME"
+  fi
+  dokku_log_info1 "Removing network: $NETWORK_NAME"
+  dokku network:destroy "$NETWORK_NAME" --force || dokku_log_warn "Failed to destroy network $NETWORK_NAME; remove it by hand: dokku network:destroy $NETWORK_NAME"
+fi
+
+# Never fail the destroy this hook is cleaning up after: the app is already
+# gone, and every step above reports its own failure.
+exit 0

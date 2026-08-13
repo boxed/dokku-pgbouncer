@@ -2,63 +2,7 @@
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
-
-PLUGIN_BASE_PATH="${PLUGIN_BASE_PATH:-/var/lib/dokku/plugins}"
-
-# Pinned: the pgbouncer/pgbouncer image reads DATABASES_* env vars whose names
-# are an implementation detail of its entrypoint, so "latest" could break us.
-PGBOUNCER_IMAGE="pgbouncer/pgbouncer:1.15.0"
-
-# Client image for the 'SELECT 1' probe, used only when the postgres service's
-# own image (which is already on this host, and always has psql) cannot be read.
-PROBE_FALLBACK_IMAGE="postgres:16-alpine"
-
-urldecode() {
-  # Decode %XX escapes (DATABASE_URL userinfo may be percent-encoded).
-  # Done char-by-char rather than via printf '%b', which would also interpret
-  # backslashes in the input and silently mangle a '%' not followed by two hex
-  # digits.
-  local encoded="$1" out="" i char hex
-  for ((i = 0; i < ${#encoded}; i++)); do
-    char="${encoded:i:1}"
-    if [[ "$char" == "%" ]]; then
-      hex="${encoded:i+1:2}"
-      if [[ "$hex" =~ ^[0-9a-fA-F]{2}$ ]]; then
-        # shellcheck disable=SC2059 # $hex is the escape being built, and is validated above
-        printf -v char "\\x$hex"
-        ((i += 2))
-      else
-        echo "Invalid percent-encoding '%${hex}'" >&2
-        return 1
-      fi
-    fi
-    out+="$char"
-  done
-  printf '%s' "$out"
-}
-
-assert_ini_safe() {
-  # The pgbouncer image writes these values unquoted into pgbouncer.ini, so
-  # characters that would break that line cannot be passed through safely.
-  local what="$1" value="$2"
-  case "$value" in
-    *"'"* | *'"'* | *[[:space:]]* | *=* | *\\*)
-      dokku_log_fail "The $what contains quotes, whitespace, '=' or '\\', which cannot be written safely into pgbouncer's config"
-      ;;
-  esac
-}
-
-container_on_network() {
-  # Reads the container rather than the network because 'docker network inspect'
-  # lists running endpoints only, while a stopped container keeps its endpoint —
-  # which still blocks both 'network connect' and 'network destroy'.
-  # Output is captured before matching: piping into 'grep -q' can kill the
-  # producer with SIGPIPE and, under 'set -o pipefail', report 141 for a match.
-  local container="$1" network="$2" nets
-  nets=$(docker inspect --format '{{range $net, $_ := .NetworkSettings.Networks}}{{$net}}{{"\n"}}{{end}}' "$container" 2>/dev/null) || return 1
-  # Command substitution strips the trailing newline, so both ends are padded.
-  [[ $'\n'"$nets"$'\n' == *$'\n'"$network"$'\n'* ]]
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
 
 case "$1" in
   pgbouncer:connect)
@@ -112,6 +56,9 @@ case "$1" in
       [[ "$DB_PORT" == "$HOSTPORT" ]] && DB_PORT=""
     fi
     [[ -z "$DB_PORT" ]] && DB_PORT="5432"
+    # The port lands on the same unquoted pgbouncer.ini line as the values
+    # checked by assert_ini_safe below, so it needs a guard of its own.
+    [[ "$DB_PORT" =~ ^[0-9]+$ ]] || dokku_log_fail "DATABASE_URL on $MAIN_APP has a non-numeric port '$DB_PORT'"
 
     [[ -z "$DB_USER" ]] && dokku_log_fail "Failed to parse user from DATABASE_URL"
     [[ -z "$DB_PASSWORD" ]] && dokku_log_fail "DATABASE_URL on $MAIN_APP has an empty password. Pgbouncer needs it to open connections to postgres."
@@ -127,10 +74,13 @@ case "$1" in
     # Credentials come from DATABASE_URL but the postgres host comes from the
     # service argument, so a wrong service silently pairs one service's
     # hostname with another's credentials. dokku-postgres links its services
-    # under 'dokku-postgres-<service>'.
-    EXPECTED_DB_HOST="dokku-postgres-$(printf '%s' "$DB_SERVICE" | tr './' '--')"
+    # under 'dokku-postgres-<service>'; the container name form is accepted too
+    # for hand-written URLs.
+    EXPECTED_DB_HOST="$(service_dns_host "$DB_SERVICE")"
     if [[ "$DB_HOST" != "$EXPECTED_DB_HOST" && "$DB_HOST" != "dokku.postgres.${DB_SERVICE}" ]]; then
-      if [[ "$DB_HOST" == dokku-postgres-* ]]; then
+      # Both naming forms have to fail hard, or a mismatch slips through as a
+      # warning for whichever form the check happens not to recognise.
+      if [[ "$DB_HOST" == dokku-postgres-* || "$DB_HOST" == dokku.postgres.* ]]; then
         dokku_log_fail "DATABASE_URL on $MAIN_APP points at '$DB_HOST', but you asked to connect service '$DB_SERVICE' (expected '$EXPECTED_DB_HOST'). Those credentials belong to a different postgres service."
       fi
       dokku_log_warn "DATABASE_URL host '$DB_HOST' does not look like postgres service '$DB_SERVICE' (expected '$EXPECTED_DB_HOST'); continuing, but verify the credentials belong to $DB_SERVICE"
@@ -147,14 +97,34 @@ case "$1" in
 
     BOUNCER_PORT="6432"
     BOUNCER_HOST="${BOUNCER_APP}.web"
+    # BOUNCER_HOST becomes a docker network alias, i.e. a single DNS label.
+    # Docker rejects the alias outright past 63 characters, which would fail
+    # much later and far from the cause.
+    [[ ${#BOUNCER_HOST} -gt 63 ]] && dokku_log_fail "The pgbouncer hostname '$BOUNCER_HOST' is ${#BOUNCER_HOST} characters, over the 63-character DNS limit. Use an app name of at most $((63 - ${#BOUNCER_HOST} + ${#MAIN_APP})) characters."
 
     # The postgres container must exist before we can attach it or borrow its
     # image for the probe below.
     docker inspect --format '{{.Id}}' "dokku.postgres.${DB_SERVICE}" >/dev/null 2>&1 ||
       dokku_log_fail "No container 'dokku.postgres.${DB_SERVICE}' found. Does postgres service '$DB_SERVICE' exist and has it been started?"
 
-    # Create a shared network for the app, pgbouncer, and postgres
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
+
+    # post-start-network is single-valued: overwriting another value would
+    # silently detach whatever set it (e.g. another app's pgbouncer) on the next
+    # postgres restart. This is a pure read and it runs before anything is
+    # created, claimed or released, so a conflict cannot leave a half-applied
+    # setup behind — in particular it must precede the detach of a previous
+    # service below, or naming a taken service would tear down this app's
+    # working pgbouncer and then abort.
+    CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
+      CURRENT_PSN=""
+      dokku_log_warn "Could not read post-start-network of $DB_SERVICE, assuming it is unset"
+    }
+    if [[ -n "$CURRENT_PSN" && "$CURRENT_PSN" != "$NETWORK_NAME" ]]; then
+      dokku_log_fail "Postgres service $DB_SERVICE already has post-start-network '$CURRENT_PSN' (likely another app's pgbouncer). A postgres service can only back one pgbouncer at a time."
+    fi
+
+    # Create a shared network for the app, pgbouncer, and postgres
     if dokku network:exists "$NETWORK_NAME" >/dev/null 2>&1; then
       dokku_log_info1 "Network $NETWORK_NAME already exists"
     else
@@ -188,6 +158,68 @@ case "$1" in
     dokku_log_info1 "Disabling the http proxy for $BOUNCER_APP"
     dokku proxy:disable "$BOUNCER_APP" || dokku_log_warn "Failed to disable proxy for $BOUNCER_APP, continuing"
 
+    # Read the main app's networks before any of the mutations below, so the
+    # rollback helpers can restore exactly what was found.
+    # Merge with any attach-post-create networks the app already has instead of clobbering them.
+    ORIGINAL_MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
+
+    # Each flag records a mutation that the rollback helpers know how to undo.
+    # They stay false when a step was already in the desired state, so a plain
+    # re-run that fails undoes nothing it did not itself change.
+    MAIN_APP_NETWORK_ADDED=false
+    MAIN_APP_RESTARTED=false
+    PREVIOUS_PSN_CLEARED=false
+    PREVIOUS_CONTAINER_DETACHED=false
+    NEW_PSN_SET=false
+    NEW_CONTAINER_CONNECTED=false
+
+    # Undo everything this command published on the main app. Used on every
+    # failure after this point so a half-applied setup is not left behind for
+    # whoever deploys the app next.
+    rollback_main_app() {
+      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_warn "Failed to unset pgbouncer env vars on $MAIN_APP"
+      if [[ "$MAIN_APP_NETWORK_ADDED" == "true" ]]; then
+        # shellcheck disable=SC2086
+        dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS || dokku_log_warn "Failed to restore attach-post-create networks of $MAIN_APP"
+      fi
+      # Only once the app has been restarted with PGBOUNCER_URL in its
+      # environment: unsetting the config alone would leave the running
+      # containers talking to a pgbouncer this run is abandoning.
+      if [[ "$MAIN_APP_RESTARTED" == "true" ]]; then
+        dokku ps:restart "$MAIN_APP" || dokku_log_warn "Failed to restart $MAIN_APP during rollback; its containers may still be using PGBOUNCER_URL"
+      fi
+    }
+
+    # Undo the postgres-side changes. post-start-network is single-valued and
+    # the docker attachment is shared, so a failed run must leave neither the
+    # new service claimed nor a previous one released.
+    rollback_services() {
+      if [[ "$NEW_CONTAINER_CONNECTED" == "true" ]] && container_on_network "dokku.postgres.${DB_SERVICE}" "$NETWORK_NAME"; then
+        docker network disconnect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" || dokku_log_warn "Failed to detach $DB_SERVICE from network $NETWORK_NAME during rollback"
+      fi
+      if [[ "$NEW_PSN_SET" == "true" ]]; then
+        dokku postgres:set "$DB_SERVICE" post-start-network "" || dokku_log_warn "Failed to clear post-start-network on $DB_SERVICE during rollback; it may now refuse to back another pgbouncer"
+      fi
+      if [[ "$PREVIOUS_PSN_CLEARED" == "true" ]]; then
+        dokku postgres:set "$PREVIOUS_SERVICE" post-start-network "$PREVIOUS_NETWORK" || dokku_log_warn "Failed to restore post-start-network of $PREVIOUS_SERVICE during rollback; re-run: dokku pgbouncer:connect $MAIN_APP $PREVIOUS_SERVICE"
+      fi
+      if [[ "$PREVIOUS_CONTAINER_DETACHED" == "true" ]] && ! container_on_network "dokku.postgres.${PREVIOUS_SERVICE}" "$PREVIOUS_NETWORK"; then
+        docker network connect "$PREVIOUS_NETWORK" "dokku.postgres.${PREVIOUS_SERVICE}" || dokku_log_warn "Failed to reattach $PREVIOUS_SERVICE to network $PREVIOUS_NETWORK during rollback; re-run: dokku pgbouncer:connect $MAIN_APP $PREVIOUS_SERVICE"
+      fi
+    }
+
+    # Every failure from here on leaves the main app as it was found, on direct
+    # postgres, and the postgres services as they were found. On a re-run over a
+    # working setup that means the app drops back to DATABASE_URL rather than
+    # keeping PGBOUNCER_URL pointed at a pgbouncer this run may have already
+    # half-reconfigured. Services are restored first so the app is restarted
+    # against a postgres that is reachable again.
+    fail_and_rollback() {
+      rollback_services
+      rollback_main_app
+      dokku_log_fail "$1"
+    }
+
     # Repointing this app at a different postgres service leaves the old
     # service attached to our network and its post-start-network still pointing
     # at us, which both widens the network's trust boundary and permanently
@@ -199,67 +231,48 @@ case "$1" in
         dokku_log_warn "Could not read post-start-network of $PREVIOUS_SERVICE, leaving it alone"
       }
       if [[ "$PREVIOUS_PSN" == "$PREVIOUS_NETWORK" ]]; then
-        dokku postgres:set "$PREVIOUS_SERVICE" post-start-network "" || dokku_log_warn "Failed to clear post-start-network on $PREVIOUS_SERVICE, continuing"
+        # Flag only on success, so a rollback restores what was really changed.
+        if dokku postgres:set "$PREVIOUS_SERVICE" post-start-network ""; then
+          PREVIOUS_PSN_CLEARED=true
+        else
+          dokku_log_warn "Failed to clear post-start-network on $PREVIOUS_SERVICE, continuing"
+        fi
       fi
       if container_on_network "dokku.postgres.${PREVIOUS_SERVICE}" "$PREVIOUS_NETWORK"; then
-        docker network disconnect "$PREVIOUS_NETWORK" "dokku.postgres.${PREVIOUS_SERVICE}" || dokku_log_warn "Failed to disconnect $PREVIOUS_SERVICE from network $PREVIOUS_NETWORK, continuing"
+        if docker network disconnect "$PREVIOUS_NETWORK" "dokku.postgres.${PREVIOUS_SERVICE}"; then
+          PREVIOUS_CONTAINER_DETACHED=true
+        else
+          dokku_log_warn "Failed to disconnect $PREVIOUS_SERVICE from network $PREVIOUS_NETWORK, continuing"
+        fi
       fi
     fi
 
     # Attach the network to all three: main app, pgbouncer, and postgres.
-    # Merge with any attach-post-create networks the app already has instead of clobbering them.
-    ORIGINAL_MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
-    MAIN_APP_NETWORK_ADDED=false
     if [[ " $ORIGINAL_MAIN_APP_NETWORKS " == *" $NETWORK_NAME "* ]]; then
       dokku_log_info1 "$MAIN_APP already set to attach to $NETWORK_NAME"
     else
       dokku_log_info1 "Attaching network to $MAIN_APP"
       # shellcheck disable=SC2086
-      dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS "$NETWORK_NAME" || dokku_log_fail "Failed to attach network to $MAIN_APP"
+      dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS "$NETWORK_NAME" || fail_and_rollback "Failed to attach network to $MAIN_APP"
       MAIN_APP_NETWORK_ADDED=true
     fi
-
-    # Undo everything this command published on the main app. Used on every
-    # failure after this point so a half-applied setup is not left behind for
-    # whoever deploys the app next.
-    rollback_main_app() {
-      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_warn "Failed to unset pgbouncer env vars on $MAIN_APP"
-      if [[ "$MAIN_APP_NETWORK_ADDED" == "true" ]]; then
-        # shellcheck disable=SC2086
-        dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS || dokku_log_warn "Failed to restore attach-post-create networks of $MAIN_APP"
-      fi
-    }
-
-    # Every failure from here on leaves the main app as it was found, on direct
-    # postgres. On a re-run over a working setup that means the app drops back
-    # to DATABASE_URL rather than keeping PGBOUNCER_URL pointed at a pgbouncer
-    # this run may have already half-reconfigured.
-    fail_and_rollback() {
-      rollback_main_app
-      dokku_log_fail "$1"
-    }
 
     dokku_log_info1 "Attaching network to $BOUNCER_APP"
     dokku network:set "$BOUNCER_APP" attach-post-create "$NETWORK_NAME" || fail_and_rollback "Failed to attach network to $BOUNCER_APP"
 
     dokku_log_info1 "Attaching postgres service $DB_SERVICE to network"
-    # post-start-network is single-valued: overwriting another value would
-    # silently detach whatever set it (e.g. another app's pgbouncer) on the
-    # next postgres restart.
-    CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
-      CURRENT_PSN=""
-      dokku_log_warn "Could not read post-start-network of $DB_SERVICE, assuming it is unset"
-    }
-    if [[ -n "$CURRENT_PSN" && "$CURRENT_PSN" != "$NETWORK_NAME" ]]; then
-      fail_and_rollback "Postgres service $DB_SERVICE already has post-start-network '$CURRENT_PSN' (likely another app's pgbouncer). A postgres service can only back one pgbouncer at a time."
+    # Set post-start-network so postgres rejoins the network on restart. Already
+    # known to be either unset or ours, checked above before anything changed.
+    if [[ "$CURRENT_PSN" != "$NETWORK_NAME" ]]; then
+      dokku postgres:set "$DB_SERVICE" post-start-network "$NETWORK_NAME" || fail_and_rollback "Failed to set post-start-network on postgres service $DB_SERVICE"
+      NEW_PSN_SET=true
     fi
-    # Set post-start-network so postgres rejoins the network on restart
-    dokku postgres:set "$DB_SERVICE" post-start-network "$NETWORK_NAME" || fail_and_rollback "Failed to set post-start-network on postgres service $DB_SERVICE"
     # Also connect the running container immediately.
     if container_on_network "dokku.postgres.${DB_SERVICE}" "$NETWORK_NAME"; then
       dokku_log_info1 "Postgres container already on network $NETWORK_NAME"
     else
       docker network connect "$NETWORK_NAME" "dokku.postgres.${DB_SERVICE}" || fail_and_rollback "Failed to connect postgres container dokku.postgres.${DB_SERVICE} to network $NETWORK_NAME"
+      NEW_CONTAINER_CONNECTED=true
     fi
 
     # Config plus the metadata pgbouncer:disconnect needs to undo everything.
@@ -307,10 +320,21 @@ case "$1" in
     # every user on the host through ps, so it goes via the environment ('-e
     # PGPASSWORD' with no value forwards ours) instead.
     PROBE_URL="postgres://${USERINFO%%:*}@${BOUNCER_HOST}:${BOUNCER_PORT}/${DB_NAME_ENCODED}"
+    # PGCONNECT_TIMEOUT only bounds the handshake with pgbouncer, which accepts
+    # clients immediately. If postgres is unreachable behind it, the query then
+    # blocks for pgbouncer's query_wait_timeout — 120s by default — so without
+    # an outer bound five attempts can hang for ten minutes before reporting
+    # failure. 'timeout' is coreutils, i.e. always present on a dokku host.
+    PROBE_TIMEOUT=(timeout 20)
+    if ! command -v timeout >/dev/null 2>&1; then
+      PROBE_TIMEOUT=()
+      dokku_log_warn "'timeout' not found; the pgbouncer probe will not be time-bounded"
+    fi
+
     dokku_log_info1 "Verifying the database is reachable through pgbouncer"
     VERIFY_OK=false
     for _ in 1 2 3 4 5; do
-      if VERIFY_OUTPUT=$(PGPASSWORD="$DB_PASSWORD" docker run --rm --network "$NETWORK_NAME" \
+      if VERIFY_OUTPUT=$(PGPASSWORD="$DB_PASSWORD" "${PROBE_TIMEOUT[@]}" docker run --rm --network "$NETWORK_NAME" \
         -e PGPASSWORD -e PGCONNECT_TIMEOUT=5 "$PROBE_IMAGE" \
         psql "$PROBE_URL" -w -v ON_ERROR_STOP=1 -tAqc 'SELECT 1' 2>&1); then
         VERIFY_OK=true
@@ -321,13 +345,14 @@ case "$1" in
     if [[ "$VERIFY_OK" != "true" ]]; then
       dokku_log_warn "Cannot query the database through pgbouncer at ${BOUNCER_HOST}:${BOUNCER_PORT} on network ${NETWORK_NAME}."
       dokku_log_warn "Output: $VERIFY_OUTPUT"
-      dokku_log_warn "$MAIN_APP has not been touched and is still using DATABASE_URL directly."
+      dokku_log_warn "$MAIN_APP is being left on DATABASE_URL (direct postgres)."
       dokku_log_warn "Check: dokku logs $BOUNCER_APP, docker network inspect ${NETWORK_NAME}"
+      rollback_services
       rollback_main_app
       dokku_log_fail "Pgbouncer verification failed"
     fi
 
-    # Publish pgbouncer connection info on the main app and rebuild.
+    # Publish pgbouncer connection info on the main app and restart it.
     # DATABASE_URL (direct postgres) is left untouched — the app decides
     # which connection to use based on PGBOUNCER_URL being set.
     dokku_log_info1 "Setting pgbouncer env vars on $MAIN_APP"
@@ -335,25 +360,33 @@ case "$1" in
       PGBOUNCER_URL="$PGBOUNCER_URL" \
       PGBOUNCER_HOST="$BOUNCER_HOST" \
       PGBOUNCER_PORT="$BOUNCER_PORT" \
-      || dokku_log_fail "Failed to set pgbouncer env vars on $MAIN_APP"
+      || fail_and_rollback "Failed to set pgbouncer env vars on $MAIN_APP"
 
-    dokku_log_info1 "Rebuilding $MAIN_APP to join network"
-    if ! dokku ps:rebuild "$MAIN_APP"; then
-      dokku_log_warn "Rebuild of $MAIN_APP failed, rolling back pgbouncer setup on $MAIN_APP"
-      rollback_main_app
-      dokku_log_fail "Failed to rebuild $MAIN_APP; the pgbouncer setup on $MAIN_APP was rolled back"
+    # ps:restart, not ps:rebuild: attach-post-create takes effect when the
+    # containers are created, so recreating them from the existing image is
+    # enough. A rebuild would additionally recompile from source, letting an
+    # unrelated build regression turn "add connection pooling" into a failed
+    # deploy on an otherwise healthy app.
+    dokku_log_info1 "Restarting $MAIN_APP to join network"
+    # Set before the attempt, not after: a restart that fails part way through
+    # may already have recreated containers carrying PGBOUNCER_URL, so the
+    # rollback has to restart the app in that case too.
+    MAIN_APP_RESTARTED=true
+    if ! dokku ps:restart "$MAIN_APP"; then
+      dokku_log_warn "Restart of $MAIN_APP failed, rolling back pgbouncer setup on $MAIN_APP"
+      fail_and_rollback "Failed to restart $MAIN_APP; the pgbouncer setup on $MAIN_APP was rolled back"
     fi
 
-    # Confirm the rebuilt containers actually joined the network; if not, roll
+    # Confirm the recreated containers actually joined the network; if not, roll
     # back so the app is not left pointing at a pgbouncer it cannot reach.
+    # MAIN_APP_RESTARTED makes the rollback restart the app again, so both
+    # branches below leave its running containers matching its config.
     dokku_log_info1 "Verifying $MAIN_APP joined network $NETWORK_NAME"
     NETWORK_MEMBERS=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}') ||
       fail_and_rollback "Failed to inspect network $NETWORK_NAME"
     if [[ $'\n'"$NETWORK_MEMBERS" != *$'\n'"${MAIN_APP}."* ]]; then
       dokku_log_warn "$MAIN_APP containers are not attached to ${NETWORK_NAME}, rolling back to direct postgres"
-      rollback_main_app
-      dokku ps:rebuild "$MAIN_APP" || dokku_log_warn "Failed to rebuild $MAIN_APP during rollback"
-      dokku_log_fail "$MAIN_APP did not join network $NETWORK_NAME; the pgbouncer setup on $MAIN_APP was rolled back. Check: docker network inspect ${NETWORK_NAME}"
+      fail_and_rollback "$MAIN_APP did not join network $NETWORK_NAME; the pgbouncer setup on $MAIN_APP was rolled back. Check: docker network inspect ${NETWORK_NAME}"
     fi
 
     dokku_log_info1 "Done! PGBOUNCER_URL is now set on $MAIN_APP"
@@ -366,6 +399,17 @@ case "$1" in
     DB_SERVICE="${3:-}"
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
+
+    # The bouncer app name is derived from the app name, which may have changed
+    # since connect (apps:rename). PGBOUNCER_HOST was recorded on the app
+    # itself, so it survives the rename and still names the real bouncer app —
+    # from which the network and service metadata below then follow.
+    STORED_HOST=$(dokku config:get "$MAIN_APP" PGBOUNCER_HOST 2>/dev/null || true)
+    if [[ -n "$STORED_HOST" && "${STORED_HOST%.web}" != "$BOUNCER_APP" ]] &&
+      dokku apps:exists "${STORED_HOST%.web}" >/dev/null 2>&1; then
+      dokku_log_info1 "$MAIN_APP records its pgbouncer as '${STORED_HOST%.web}' rather than $BOUNCER_APP (renamed app?), using that"
+      BOUNCER_APP="${STORED_HOST%.web}"
+    fi
 
     if dokku apps:exists "$BOUNCER_APP" >/dev/null 2>&1; then
       BOUNCER_EXISTS=true
@@ -392,28 +436,45 @@ case "$1" in
       dokku_log_fail "App $BOUNCER_APP exists but was not created by this plugin (no DOKKU_PGBOUNCER_DB_SERVICE set). Refusing to destroy it. Remove it by hand if it really is the pgbouncer app: dokku apps:destroy $BOUNCER_APP"
     fi
 
-    # Remove PGBOUNCER_URL from the app — the app falls back to DATABASE_URL
-    dokku_log_info1 "Removing PGBOUNCER_URL from $MAIN_APP"
-    dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_fail "Failed to unset pgbouncer env vars on $MAIN_APP"
+    # The main app may already be gone (destroyed by hand), in which case there
+    # is nothing to move back onto direct postgres — but the pgbouncer app,
+    # network and post-start-network still need releasing.
+    if dokku apps:exists "$MAIN_APP" >/dev/null 2>&1; then
+      # Remove PGBOUNCER_URL from the app — the app falls back to DATABASE_URL
+      dokku_log_info1 "Removing PGBOUNCER_URL from $MAIN_APP"
+      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_fail "Failed to unset pgbouncer env vars on $MAIN_APP"
 
-    # Detach our network from the main app, keeping any other networks it has
-    MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
-    REMAINING_NETWORKS=""
-    for net in $MAIN_APP_NETWORKS; do
-      [[ "$net" == "$NETWORK_NAME" ]] && continue
-      REMAINING_NETWORKS="$REMAINING_NETWORKS $net"
-    done
-    dokku_log_info1 "Detaching network $NETWORK_NAME from $MAIN_APP"
-    # shellcheck disable=SC2086
-    dokku network:set "$MAIN_APP" attach-post-create $REMAINING_NETWORKS || dokku_log_fail "Failed to detach network from $MAIN_APP"
+      # Detach our network from the main app, keeping any other networks it has
+      MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
+      REMAINING_NETWORKS=""
+      for net in $MAIN_APP_NETWORKS; do
+        [[ "$net" == "$NETWORK_NAME" ]] && continue
+        REMAINING_NETWORKS="$REMAINING_NETWORKS $net"
+      done
+      dokku_log_info1 "Detaching network $NETWORK_NAME from $MAIN_APP"
+      # shellcheck disable=SC2086
+      dokku network:set "$MAIN_APP" attach-post-create $REMAINING_NETWORKS || dokku_log_fail "Failed to detach network from $MAIN_APP"
 
-    dokku_log_info1 "Rebuilding $MAIN_APP"
-    dokku ps:rebuild "$MAIN_APP" || dokku_log_fail "Failed to rebuild $MAIN_APP"
+      # Not fatal: the remaining steps are exactly what was asked for, and they
+      # are the only way to release the postgres service's single-valued
+      # post-start-network. Aborting here used to strand the bouncer app, the
+      # network and that property with no command left that would clean them up —
+      # every retry died on this same line. Common causes are an app that is
+      # scaled to zero, was never deployed, or no longer builds.
+      dokku_log_info1 "Restarting $MAIN_APP"
+      if ! dokku ps:restart "$MAIN_APP"; then
+        dokku_log_warn "Failed to restart $MAIN_APP; its running containers may still have PGBOUNCER_URL set until the next deploy. Continuing with the teardown."
+      fi
+    else
+      dokku_log_info1 "App $MAIN_APP does not exist, only tearing down the pgbouncer side"
+    fi
 
     # App is now running on direct postgres. Safe to tear down pgbouncer.
     if [[ "$BOUNCER_EXISTS" == "true" ]]; then
       dokku_log_info1 "Destroying pgbouncer app: $BOUNCER_APP"
-      dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_fail "Failed to destroy $BOUNCER_APP"
+      # Also not fatal, for the same reason: the postgres service still has to
+      # be released, and a retry can pick the destroy up again.
+      dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_warn "Failed to destroy $BOUNCER_APP, continuing with the teardown"
     else
       dokku_log_info1 "Pgbouncer app $BOUNCER_APP does not exist, skipping destroy"
     fi
@@ -456,7 +517,7 @@ case "$1" in
     dokku config:show "$BOUNCER_APP" | sed -E 's/^(DATABASES_PASSWORD:[[:space:]]*).*/\1[redacted]/' || dokku_log_fail "Failed to show config for $BOUNCER_APP. Is pgbouncer set up for this app?"
     ;;
 
-  help | pgbouncer:help)
+  help | pgbouncer | pgbouncer:help)
     help_content_func() {
       # shellcheck disable=SC2034 # dokku's plugin help machinery reads $desc
       declare desc="return pgbouncer plugin help content"
@@ -466,7 +527,9 @@ case "$1" in
     pgbouncer:info <app>, Show pgbouncer config for an app
 EOF
     }
-    if [[ $1 == "pgbouncer:help" ]]; then
+    # Bare 'dokku pgbouncer' gets the human-readable form; plain 'help' is
+    # dokku's own help machinery asking for the machine-readable listing.
+    if [[ $1 == "pgbouncer:help" || $1 == "pgbouncer" ]]; then
       echo -e "Usage: dokku pgbouncer[:COMMAND]"
       echo ""
       echo -e "Manage pgbouncer connection pooling"
