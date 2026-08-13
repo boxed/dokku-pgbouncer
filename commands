@@ -425,6 +425,16 @@ case "$1" in
     for tuning_pair in "${PGBOUNCER_TUNING_DEFAULTS[@]}"; do
       [[ -n "$(dokku config:get "$BOUNCER_APP" "${tuning_pair%%=*}" 2>/dev/null || true)" ]] && continue
       TUNING_TO_SET+=("$tuning_pair")
+      # A pgbouncer app this plugin already configured, yet with no POOL_MODE, was
+      # set up by a version that left pgbouncer at its own default of session
+      # pooling. Transaction pooling is the right default for a new setup but a
+      # change of behaviour for that one, and what it costs is only noticed at
+      # runtime, in the app — not here, where the connect looks like a success.
+      if [[ "$tuning_pair" == POOL_MODE=* && -n "$PREVIOUS_SERVICE" ]]; then
+        dokku_log_warn "$BOUNCER_APP had no POOL_MODE, which means pgbouncer's own default of session pooling; this run sets ${tuning_pair#POOL_MODE=} pooling instead."
+        dokku_log_warn "That drops session-scoped state: LISTEN/NOTIFY, session-level advisory locks, WITH HOLD cursors and SET outside a transaction stop working."
+        dokku_log_warn "If $MAIN_APP needs any of them, keep the old behaviour: dokku config:set $BOUNCER_APP POOL_MODE=session"
+      fi
     done
     if [[ ${#TUNING_TO_SET[@]} -gt 0 ]]; then
       dokku_log_info1 "Applying pgbouncer tuning defaults"

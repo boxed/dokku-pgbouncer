@@ -154,7 +154,7 @@ The plugin is seven files: `commands` (the three subcommands), `functions` (help
 dokku pgbouncer:connect myapp my-database
 ```
 
-That redeploys the new image, switches the app to authenticated transaction pooling, and clears the old `DATABASES_*` config — including the plaintext `DATABASES_PASSWORD` that 0.1.x left in `dokku config:show`. Read the transaction-pooling caveats above first; add `dokku config:set myapp-pgbouncer POOL_MODE=session` beforehand to keep the old behaviour.
+That redeploys the new image, switches the app to authenticated transaction pooling, and clears the old `DATABASES_*` config — including the plaintext `DATABASES_PASSWORD` that 0.1.x left in `dokku config:show`. Read the transaction-pooling caveats above first; add `dokku config:set myapp-pgbouncer POOL_MODE=session` beforehand to keep the old behaviour. `pgbouncer:connect` also warns as it makes that switch, since what it costs only shows up later, inside your app.
 
 ## Tests
 

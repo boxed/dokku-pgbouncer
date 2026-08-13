@@ -744,6 +744,7 @@ run pgbouncer:connect myapp mydb
 check "second connect succeeds" eq "$RC" "0"
 check "override kept" eq "$(cfg myapp-pgbouncer POOL_MODE)" "session"
 check "other defaults kept" eq "$(cfg myapp-pgbouncer DEFAULT_POOL_SIZE)" "20"
+check "nothing to warn about" hasnt "$OUT" "default of session pooling"
 
 # An app deployed by a version of this plugin that recorded no image still has
 # to survive a re-run, via the "No changes detected" fallback.
@@ -773,6 +774,28 @@ run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"
 check "redeployed" has "$(cat "$CALLS")" "git:from-image myapp-pgbouncer edoburu/pgbouncer:v1.25.2-p0"
 check "record updated" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_IMAGE)" "edoburu/pgbouncer:v1.25.2-p0"
+
+# A pooler of ours with no POOL_MODE was set up by 0.1.x, i.e. session pooling.
+# Moving it to transaction pooling is a change of behaviour whose cost only shows
+# up at runtime in the app, so it cannot pass silently.
+setup "upgrading a pooler that had no POOL_MODE says what changes"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "names what it was" has "$OUT" "default of session pooling"
+check "names what breaks" has "$OUT" "LISTEN/NOTIFY"
+check "says how to keep it" has "$OUT" "POOL_MODE=session"
+check "transaction pooling applied" eq "$(cfg myapp-pgbouncer POOL_MODE)" "transaction"
+
+setup "a first connect does not warn about pool mode"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "no warning" hasnt "$OUT" "default of session pooling"
 
 # The plaintext password the old image needed must not be left in config:show.
 setup "connect clears the legacy DATABASES_* config"
