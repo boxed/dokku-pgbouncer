@@ -11,6 +11,7 @@ case "$1" in
     MAIN_APP="$2"
     DB_SERVICE="$3"
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
+    take_plugin_lock
 
     # The service name becomes DB_HOST, which the image interpolates into a
     # printf format string, so it gets the same allowlist as the other
@@ -577,6 +578,7 @@ case "$1" in
     MAIN_APP="$2"
     DB_SERVICE="${3:-}"
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
+    take_plugin_lock
 
     # The bouncer app name is derived from the app name, which may have changed
     # since connect (apps:rename). PGBOUNCER_HOST was recorded on the app

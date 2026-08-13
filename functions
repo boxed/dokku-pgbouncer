@@ -80,6 +80,36 @@ quiet_dokku() {
   DOKKU_QUIET_OUTPUT=1 dokku "$@"
 }
 
+# How long to wait for another pgbouncer command to finish. Overridable so the
+# tests do not have to wait out the real thing.
+PGBOUNCER_LOCK_WAIT="${PGBOUNCER_LOCK_WAIT:-300}"
+
+# 'pgbouncer:connect' reads a postgres service's post-start-network, concludes it
+# is free, and only then claims it. Two runs racing through that window would
+# both conclude it, and the loser's app would be detached from its network on the
+# next postgres restart — silently, since nothing checks again afterwards.
+#
+# One lock for the whole plugin rather than one per service: connect and
+# disconnect also mutate a shared network and derive app names from each other,
+# and these are hand-run commands where serialising costs nothing.
+#
+# Never fatal when locking is unavailable: refusing to work at all would be worse
+# than the race it prevents, so it says what it could not do and carries on.
+take_plugin_lock() {
+  local lock="$PGBOUNCER_DATA_ROOT/plugin.lock"
+  if ! command -v flock >/dev/null 2>&1; then
+    dokku_log_warn "'flock' not found, so this command cannot be serialised against other pgbouncer commands; do not run two at once"
+    return 0
+  fi
+  if ! mkdir -p "$PGBOUNCER_DATA_ROOT" 2>/dev/null || ! exec 9>"$lock"; then
+    dokku_log_warn "Could not open $lock, so this command cannot be serialised against other pgbouncer commands; do not run two at once"
+    return 0
+  fi
+  # Held until this shell exits, which is what releases it.
+  flock -w "$PGBOUNCER_LOCK_WAIT" 9 ||
+    dokku_log_fail "Another pgbouncer command has been holding $lock for more than ${PGBOUNCER_LOCK_WAIT}s. Wait for it to finish, or remove that file if nothing is running."
+}
+
 # 'apps:rename' is implemented as create-new plus destroy-old, so dokku fires
 # the post-delete trigger for the *old* name in the middle of a rename.
 # Tearing the pgbouncer setup down there is exactly wrong: the renamed app is

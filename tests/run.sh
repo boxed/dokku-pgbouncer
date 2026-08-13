@@ -684,6 +684,32 @@ run_hook pre-delete myapp-pgbouncer some-image-tag
 check "exits 0" eq "$RC" "0"
 check "says nothing" hasnt "$OUT" "pgbouncer app of"
 
+# --- 20d. two commands at once ------------------------------------------------
+# connect decides a postgres service is free and only then claims it; two runs
+# racing through that window would both decide it, and the loser's app would be
+# detached from its network on the next postgres restart.
+if command -v flock >/dev/null 2>&1; then
+  setup "connect refuses to race another pgbouncer command"
+  mkdir -p "$STATE/data/pgbouncer"
+  (flock 9 && sleep 5) 9>"$STATE/data/pgbouncer/plugin.lock" &
+  HOLDER=$!
+  sleep 0.3
+  export PGBOUNCER_LOCK_WAIT=1
+  run pgbouncer:connect myapp mydb
+  unset PGBOUNCER_LOCK_WAIT
+  kill "$HOLDER" 2>/dev/null
+  wait "$HOLDER" 2>/dev/null
+  check "fails instead of racing" eq "$RC" "1"
+  check "names the other command" has "$OUT" "holding"
+  check "service not claimed" eq "$(psn mydb)" ""
+  check "app untouched" eq "$(cfg myapp PGBOUNCER_URL)" ""
+else
+  setup "connect says it cannot serialise itself without flock"
+  run pgbouncer:connect myapp mydb
+  check "exits 0" eq "$RC" "0"
+  check "warns" has "$OUT" "cannot be serialised"
+fi
+
 # --- 21. bare command shows usage -------------------------------------------
 setup "bare pgbouncer command"
 run pgbouncer
