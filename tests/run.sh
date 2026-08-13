@@ -808,6 +808,25 @@ check "exits 0" eq "$RC" "0"
 check "bouncer app destroyed" gone "app_myapp-pgbouncer"
 check "service released" eq "$(psn mydb)" ""
 
+# dokku aborts the rename if a post-app-rename-setup trigger fails, and skips
+# post-app-rename if the destroy fails — in both cases the marker survives with
+# nothing left to clear it. Taken at face value it would disable the teardown for
+# the next genuine apps:destroy, so it expires.
+setup "an aborted rename does not disable the next destroy"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+run_hook post-app-rename-setup myapp renamed
+check "marker written" marker myapp
+touch -t 200001010000 "$STATE/data/pgbouncer/renaming.myapp"
+run_hook post-delete myapp
+check "exits 0" eq "$RC" "0"
+check "names the cause" has "$OUT" "aborted rename"
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+check "network destroyed" gone "net_pgbouncer-myapp"
+
 setup "rename hook clears a marker left by an aborted rename"
 touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer"
 printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"

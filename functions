@@ -89,6 +89,24 @@ rename_marker() {
   printf '%s/renaming.%s' "$PGBOUNCER_DATA_ROOT" "$1"
 }
 
+# How long a rename marker may be taken at face value. dokku's rename destroys
+# the old app immediately after running post-app-rename-setup, so a marker more
+# than minutes old belongs to a rename that never got that far: dokku aborts the
+# rename if any post-app-rename-setup trigger fails, and skips post-app-rename —
+# the only other thing that clears the marker — if the destroy itself fails.
+# Without an expiry, that stale marker silently disables the teardown for the
+# next genuine apps:destroy and orphans the whole setup.
+PGBOUNCER_RENAME_MARKER_TTL=600
+
+# Age of a file in whole seconds, or nothing (and non-zero) if it cannot be
+# determined. GNU and BSD stat disagree on how to ask, so both are tried.
+file_age_seconds() {
+  local mtime
+  mtime=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || return 1
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$(($(date +%s) - mtime))"
+}
+
 # Written by pre-delete, consumed by post-delete: the name of the pgbouncer app
 # belonging to the app being destroyed. Needed because post-delete can only
 # derive '<app>-pgbouncer', which is the wrong name for an app that has been

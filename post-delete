@@ -26,12 +26,23 @@ BOUNCER_APP="${APP}-pgbouncer"
 # runs before that destroy and leaves a marker to tell the two apart.
 MARKER="$(rename_marker "$APP")"
 if [[ -e "$MARKER" ]]; then
+  # A marker older than the rename that would have written it means the rename
+  # never reached this destroy. Trusting it then would skip the teardown for a
+  # genuine apps:destroy — the leak this whole hook exists to prevent — so it is
+  # expired instead. An age that cannot be read keeps the cautious reading: a
+  # skipped teardown can be finished later with pgbouncer:disconnect, while a
+  # teardown of a live setup cannot be taken back.
+  MARKER_AGE=$(file_age_seconds "$MARKER") || MARKER_AGE=""
   rm -f "$MARKER"
-  # Renaming an already-renamed app leaves a delete note from pre-delete that
-  # nothing else would consume; the setup it points at is staying put.
-  rm -f "$(delete_note "$APP")"
-  dokku_log_info1 "$APP is being renamed, leaving its pgbouncer setup in place"
-  exit 0
+  if [[ -z "$MARKER_AGE" ]] || ((MARKER_AGE <= PGBOUNCER_RENAME_MARKER_TTL)); then
+    # Renaming an already-renamed app leaves a delete note from pre-delete that
+    # nothing else would consume; the setup it points at is staying put.
+    rm -f "$(delete_note "$APP")"
+    dokku_log_info1 "$APP is being renamed, leaving its pgbouncer setup in place"
+    exit 0
+  fi
+  dokku_log_warn "Found a pgbouncer rename marker for $APP written ${MARKER_AGE}s ago, too long to be the rename destroying it now (an aborted rename?)."
+  dokku_log_warn "Treating this as a real apps:destroy and tearing the pgbouncer setup down."
 fi
 
 # pre-delete resolves PGBOUNCER_HOST while the app still exists, which is the
