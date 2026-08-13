@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Dokku calls this after an app is renamed.
+# Dokku calls this at the end of 'apps:rename'.
 #
 # Every name this plugin uses is derived from the app name: the pgbouncer app
 # (<app>-pgbouncer), the shared network (pgbouncer-<app>), and PGBOUNCER_URL's
 # host (<app>-pgbouncer.web). A rename leaves all of them pointing at the old
-# name, so the setup keeps working but 'pgbouncer:disconnect <new-name>' no
-# longer finds anything to clean up.
+# name. That is harmless in itself — the app keeps working, and disconnect
+# follows PGBOUNCER_HOST rather than the naming convention — but the mismatch
+# is confusing enough to be worth saying out loud.
 #
-# Renaming them here is not safe to do behind the operator's back — it means
+# Renaming them for real is not safe to do behind the operator's back: it means
 # destroying and redeploying the pgbouncer app, which drops every pooled
-# connection — so make the mismatch loud instead of silent.
+# connection. So make the mismatch loud instead of silent.
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
 
 # Argument order has varied across dokku versions; the app that still exists is
 # the new one either way.
@@ -25,6 +27,11 @@ for candidate in "${1:-}" "${2:-}"; do
   fi
 done
 [[ -z "${OLD_APP:-}" || -z "${NEW_APP:-}" ]] && exit 0
+
+# post-delete consumes the marker as the rename passes through it. Clearing it
+# again here covers a rename that failed before reaching the destroy, so a
+# later genuine apps:destroy is not silently skipped.
+rm -f "$(rename_marker "$OLD_APP")" 2>/dev/null || true
 
 OLD_BOUNCER_APP="${OLD_APP}-pgbouncer"
 DB_SERVICE=$(dokku config:get "$OLD_BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)

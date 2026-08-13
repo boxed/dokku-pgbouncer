@@ -18,13 +18,18 @@ setup() {
   STATE=$(mktemp -d "$ROOT/tests/state.XXXXXX")
   CALLS="$STATE/calls.log"
   : >"$CALLS"
-  export STATE CALLS
+  # The plugin keeps its rename marker under $DOKKU_LIB_ROOT/data/pgbouncer.
+  export STATE CALLS DOKKU_LIB_ROOT="$STATE"
   touch "$STATE/app_myapp"
   printf '' >"$STATE/apc_myapp"
   printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
   printf 'postgres:16.2' >"$STATE/container_dokku.postgres.mydb"
   touch "$STATE/image_postgres_16.2"
+  printf 'true' >"$STATE/deployed_myapp"
+  printf 'true' >"$STATE/running_myapp"
 }
+
+marker() { [[ -e "$STATE/data/pgbouncer/renaming.$1" ]]; }
 
 run() {
   OUT=$("$ROOT/commands" "$@" 2>&1)
@@ -60,6 +65,7 @@ eq() { [[ "$1" == "$2" ]] || { echo "  expected '$2', got '$1'"; return 1; }; }
 gone() { [[ ! -e "$STATE/$1" ]] || { echo "  expected $1 to be gone"; return 1; }; }
 kept() { [[ -e "$STATE/$1" ]] || { echo "  expected $1 to still exist"; return 1; }; }
 has() { [[ "$1" == *"$2"* ]] || { echo "  expected to contain '$2'"; return 1; }; }
+not() { ! "$@"; }
 hasnt() { [[ "$1" != *"$2"* ]] || { echo "  expected NOT to contain '$2'"; return 1; }; }
 
 # --- 1. happy path -----------------------------------------------------------
@@ -68,9 +74,13 @@ run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"
 check "PGBOUNCER_URL" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb"
 check "PGBOUNCER_HOST" eq "$(cfg myapp PGBOUNCER_HOST)" "myapp-pgbouncer.web"
-check "DATABASES_DBNAME" eq "$(cfg myapp-pgbouncer DATABASES_DBNAME)" "mydb"
-check "DATABASES_PORT" eq "$(cfg myapp-pgbouncer DATABASES_PORT)" "5432"
+check "DB_NAME" eq "$(cfg myapp-pgbouncer DB_NAME)" "mydb"
+check "DB_PORT" eq "$(cfg myapp-pgbouncer DB_PORT)" "5432"
+check "listen port pinned" eq "$(cfg myapp-pgbouncer LISTEN_PORT)" "6432"
+check "clients must authenticate" eq "$(cfg myapp-pgbouncer AUTH_TYPE)" "scram-sha-256"
+check "admin console closed" hasnt "$(cfg myapp-pgbouncer ADMIN_USERS)" "postgres"
 check "marker set" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_DB_SERVICE)" "mydb"
+check "deployed image recorded" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_IMAGE)" "edoburu/pgbouncer:v1.25.2-p0"
 check "post-start-network" eq "$(psn mydb)" "pgbouncer-myapp"
 check "DATABASE_URL kept" eq "$(cfg myapp DATABASE_URL)" "postgres://postgres:secret123@dokku-postgres-mydb:5432/mydb"
 check "postgres on network" has "$(members pgbouncer-myapp)" "dokku.postgres.mydb"
@@ -79,13 +89,22 @@ check "probe reuses service image" has "$(cat "$CALLS")" "docker run --rm --netw
 check "probe runs a query" has "$(cat "$CALLS")" "SELECT 1"
 check "probe keeps the password out of argv" hasnt "$(grep '^docker run' "$CALLS")" "secret123"
 check "no image pulled" hasnt "$(cat "$CALLS")" "docker pull"
+# dokku's config:set echoes the values it sets unless DOKKU_QUIET_OUTPUT is on,
+# which would print the password and the password-bearing PGBOUNCER_URL.
+check "bouncer credentials set quietly" has "$(grep 'DB_PASSWORD=' "$CALLS")" "dokku [quiet] config:set"
+check "PGBOUNCER_URL set quietly" has "$(grep 'PGBOUNCER_URL=' "$CALLS")" "dokku [quiet] config:set"
+check "tuning defaults applied" eq "$(cfg myapp-pgbouncer POOL_MODE)" "transaction"
+check "prepared statements survive transaction mode" eq "$(cfg myapp-pgbouncer MAX_PREPARED_STATEMENTS)" "100"
+# Silently ignoring 'options' would let a client's search_path be dropped and
+# its queries read the wrong schema; a rejected connection is the safer default.
+check "startup parameters not silently ignored" eq "$(cfg myapp-pgbouncer IGNORE_STARTUP_PARAMETERS)" ""
 
 # --- 1b. percent-encoded database name --------------------------------------
 setup "percent-encoded database name"
 printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/my%%2Ddb' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"
-check "pgbouncer gets the real name" eq "$(cfg myapp-pgbouncer DATABASES_DBNAME)" "my-db"
+check "pgbouncer gets the real name" eq "$(cfg myapp-pgbouncer DB_NAME)" "my-db"
 check "url keeps encoding" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/my%2Ddb"
 
 # --- 2. percent-encoded credentials, '@' in password -------------------------
@@ -93,9 +112,34 @@ setup "percent-encoded credentials"
 printf 'postgres://us%%65r:p%%40ss@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"
-check "user decoded" eq "$(cfg myapp-pgbouncer DATABASES_USER)" "user"
-check "password decoded" eq "$(cfg myapp-pgbouncer DATABASES_PASSWORD)" "p@ss"
+check "user decoded" eq "$(cfg myapp-pgbouncer DB_USER)" "user"
+check "password decoded" eq "$(cfg myapp-pgbouncer DB_PASSWORD)" "p@ss"
 check "url keeps encoding" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://us%65r:p%40ss@myapp-pgbouncer.web:6432/mydb"
+
+# The authority ends at the first '/', so an unencoded '@' in the password is
+# still part of the userinfo rather than a second split point.
+setup "unencoded '@' in the password"
+printf 'postgres://postgres:p@ss@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "password kept whole" eq "$(cfg myapp-pgbouncer DB_PASSWORD)" "p@ss"
+check "host parsed" eq "$(cfg myapp-pgbouncer DB_HOST)" "dokku.postgres.mydb"
+
+# Splitting the whole URL on its last '@' would take the one in the path and
+# leave 'db' as the host; the authority split has to happen before the path.
+setup "unencoded '@' in the database name"
+printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/my@db' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "blames the database name, not the host" has "$OUT" "database name 'my@db'"
+
+# "$(urldecode ...)" used to strip the trailing newline, so this password
+# reached pgbouncer truncated instead of being rejected.
+setup "password with a trailing newline"
+printf 'postgres://postgres:secret%%0A@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "names the problem" has "$OUT" "password contains quotes, whitespace"
 
 # --- 3. service argument does not match DATABASE_URL host --------------------
 setup "wrong service argument"
@@ -111,29 +155,42 @@ setup "query string"
 printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/mydb?sslmode=require' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"
-check "dbname has no query" eq "$(cfg myapp-pgbouncer DATABASES_DBNAME)" "mydb"
+check "dbname has no query" eq "$(cfg myapp-pgbouncer DB_NAME)" "mydb"
 check "warns about query" has "$OUT" "Ignoring the query string"
 check "warns about TLS" has "$OUT" "asks for TLS"
 check "url has no query" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb"
 
-# --- 5. values that cannot be written into pgbouncer.ini --------------------
+# --- 5. values the image cannot be handed safely ----------------------------
+# The entrypoint interpolates the identifiers into a printf format string and
+# into a grep regex, so they are checked against an allowlist.
 setup "unsafe database name"
 printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/my%%20db' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "fails" eq "$RC" "1"
-check "names the field" has "$OUT" "database name contains"
+check "names the field" has "$OUT" "database name 'my db'"
+
+setup "database name with a printf conversion in it"
+printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/my%%25sdb' >"$STATE/cfg_myapp_DATABASE_URL"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "names the field" has "$OUT" "database name 'my%sdb'"
 
 setup "unsafe user"
 printf 'postgres://po%%22stgres:secret123@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "fails" eq "$RC" "1"
-check "names the field" has "$OUT" "database user contains"
+check "names the field" has "$OUT" "database user"
 
 setup "unsafe password"
 printf 'postgres://postgres:sec%%20ret@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
 run pgbouncer:connect myapp mydb
 check "fails" eq "$RC" "1"
 check "names the field" has "$OUT" "database password contains"
+
+setup "unsafe service name"
+run pgbouncer:connect myapp 'my db'
+check "fails" eq "$RC" "1"
+check "names the field" has "$OUT" "postgres service name 'my db'"
 
 # --- 6. no password in DATABASE_URL -----------------------------------------
 setup "no password"
@@ -289,13 +346,23 @@ check "says so" has "$OUT" "leaving it alone"
 # --- 13. info ---------------------------------------------------------------
 setup "info redacts the password"
 touch "$STATE/app_myapp-pgbouncer"
-printf 'hunter2' >"$STATE/cfg_myapp-pgbouncer_DATABASES_PASSWORD"
-printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DATABASES_DBNAME"
+printf 'hunter2' >"$STATE/cfg_myapp-pgbouncer_DB_PASSWORD"
+printf 'legacyhunter2' >"$STATE/cfg_myapp-pgbouncer_DATABASES_PASSWORD"
+printf 'postgres://postgres:urlhunter2@dokku.postgres.mydb:5432/mydb' >"$STATE/cfg_myapp-pgbouncer_DATABASE_URL"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DB_NAME"
 run pgbouncer:info myapp
 check "exits 0" eq "$RC" "0"
 check "password hidden" hasnt "$OUT" "hunter2"
 check "redaction marker" has "$OUT" "[redacted]"
-check "other keys shown" has "$OUT" "DATABASES_DBNAME:  mydb"
+check "other keys shown" has "$OUT" "DB_NAME:  mydb"
+
+setup "info follows a renamed app"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DB_NAME"
+run pgbouncer:info newname
+check "exits 0" eq "$RC" "0"
+check "reads the recorded app" has "$OUT" "DB_NAME:  mydb"
 
 # --- 14. argument validation ------------------------------------------------
 setup "missing arguments"
@@ -360,7 +427,7 @@ run pgbouncer:connect myapp my_db
 check "exits 0" eq "$RC" "0"
 check "no mismatch complaint" hasnt "$OUT" "different postgres service"
 check "no mismatch warning" hasnt "$OUT" "does not look like"
-check "host points at the service" eq "$(cfg myapp-pgbouncer DATABASES_HOST)" "dokku.postgres.my_db"
+check "host points at the service" eq "$(cfg myapp-pgbouncer DB_HOST)" "dokku.postgres.my_db"
 
 # The container-name form of the host has to fail hard on a mismatch too, or the
 # guard only catches whichever spelling it happens to recognise.
@@ -377,7 +444,7 @@ printf 'postgres://postgres:secret123@dokku-postgres-mydb:54 32/mydb' >"$STATE/c
 run pgbouncer:connect myapp mydb
 check "fails" eq "$RC" "1"
 check "names the problem" has "$OUT" "non-numeric port"
-check "nothing configured" eq "$(cfg myapp-pgbouncer DATABASES_PORT)" ""
+check "nothing configured" eq "$(cfg myapp-pgbouncer DB_PORT)" ""
 
 # --- 18. disconnect finishes the teardown even if the app cannot restart -----
 setup "disconnect continues when the app cannot restart"
@@ -463,6 +530,172 @@ run pgbouncer
 check "exits 0" eq "$RC" "0"
 check "shows usage" has "$OUT" "Usage: dokku pgbouncer"
 check "lists connect" has "$OUT" "pgbouncer:connect"
+
+# --- 22. re-running connect ---------------------------------------------------
+# 'dokku git:from-image' returns non-zero when the committed "FROM <image>" is
+# unchanged, which is exactly what a re-run against a pinned image produces.
+# Treating that as a deploy failure rolled the working setup back onto direct
+# postgres — and re-running is the documented way to apply rotated credentials.
+setup "re-running connect keeps the setup and applies new credentials"
+run pgbouncer:connect myapp mydb
+check "first connect succeeds" eq "$RC" "0"
+printf 'postgres://postgres:rotated456@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_myapp_DATABASE_URL"
+: >"$CALLS"
+run pgbouncer:connect myapp mydb
+check "second connect succeeds" eq "$RC" "0"
+check "no redundant image deploy" hasnt "$(cat "$CALLS")" "git:from-image"
+check "bouncer restarted instead" has "$(cat "$CALLS")" "ps:restart myapp-pgbouncer"
+check "new password applied" eq "$(cfg myapp-pgbouncer DB_PASSWORD)" "rotated456"
+check "app still pooled" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:rotated456@myapp-pgbouncer.web:6432/mydb"
+check "service still claimed" eq "$(psn mydb)" "pgbouncer-myapp"
+check "app still on the network" has "$(members pgbouncer-myapp)" "myapp.web.1"
+
+setup "an operator's tuning override survives a re-run"
+run pgbouncer:connect myapp mydb
+check "first connect succeeds" eq "$RC" "0"
+printf 'session' >"$STATE/cfg_myapp-pgbouncer_POOL_MODE"
+run pgbouncer:connect myapp mydb
+check "second connect succeeds" eq "$RC" "0"
+check "override kept" eq "$(cfg myapp-pgbouncer POOL_MODE)" "session"
+check "other defaults kept" eq "$(cfg myapp-pgbouncer DEFAULT_POOL_SIZE)" "20"
+
+# An app deployed by a version of this plugin that recorded no image still has
+# to survive a re-run, via the "No changes detected" fallback.
+setup "re-run of an app with no recorded image"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'edoburu/pgbouncer:v1.25.2-p0' >"$STATE/fromimage_myapp-pgbouncer"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "tolerated the no-op deploy" has "$OUT" "already runs edoburu/pgbouncer"
+check "image now recorded" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_IMAGE)" "edoburu/pgbouncer:v1.25.2-p0"
+
+setup "a changed image pin redeploys"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer/pgbouncer:1.15.0' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_IMAGE"
+printf 'pgbouncer/pgbouncer:1.15.0' >"$STATE/fromimage_myapp-pgbouncer"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "redeployed" has "$(cat "$CALLS")" "git:from-image myapp-pgbouncer edoburu/pgbouncer:v1.25.2-p0"
+check "record updated" eq "$(cfg myapp-pgbouncer DOKKU_PGBOUNCER_IMAGE)" "edoburu/pgbouncer:v1.25.2-p0"
+
+# The plaintext password the old image needed must not be left in config:show.
+setup "connect clears the legacy DATABASES_* config"
+touch "$STATE/app_myapp-pgbouncer"
+printf 'false' >"$STATE/deployed_myapp-pgbouncer"
+printf 'oldsecret' >"$STATE/cfg_myapp-pgbouncer_DATABASES_PASSWORD"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DATABASES_DBNAME"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "legacy password gone" eq "$(cfg myapp-pgbouncer DATABASES_PASSWORD)" ""
+check "legacy dbname gone" eq "$(cfg myapp-pgbouncer DATABASES_DBNAME)" ""
+
+# --- 23. apps with nothing running -------------------------------------------
+# dokku's ps:restart succeeds without doing anything on an undeployed app, so
+# the network check three steps later would fail and blame the network.
+setup "connect refuses an app that was never deployed"
+printf 'false' >"$STATE/deployed_myapp"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "blames the missing deploy" has "$OUT" "no deployment yet"
+check "nothing created" eq "$(apc myapp)" ""
+check "service untouched" eq "$(psn mydb)" ""
+
+setup "connect warns rather than rolls back when the app is scaled to zero"
+printf 'false' >"$STATE/running_myapp"
+touch "$STATE/nojoin"
+run pgbouncer:connect myapp mydb
+check "exits 0" eq "$RC" "0"
+check "says why nothing attached" has "$OUT" "scaled to zero"
+check "app still pointed at pgbouncer" eq "$(cfg myapp PGBOUNCER_URL)" "postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb"
+check "network still attached for next scale-up" eq "$(apc myapp)" "pgbouncer-myapp"
+
+# --- 24. apps:rename must not tear the setup down ----------------------------
+# dokku implements apps:rename as create-new + destroy-old, so post-delete
+# fires for the old name mid-rename. Without the marker it destroys the
+# pgbouncer app, releases the postgres service and removes the network, leaving
+# the renamed app pointing at a host that no longer resolves.
+setup "rename leaves the pgbouncer setup intact"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-oldname' >"$STATE/psn_mydb"
+printf 'dokku.postgres.mydb\n' >"$STATE/netmembers_pgbouncer-oldname"
+run_hook post-app-rename-setup oldname newname
+check "setup hook exits 0" eq "$RC" "0"
+check "marker written" marker oldname
+run_hook post-delete oldname
+check "post-delete exits 0" eq "$RC" "0"
+check "says it is a rename" has "$OUT" "being renamed"
+check "bouncer app kept" kept "app_oldname-pgbouncer"
+check "service still claimed" eq "$(psn mydb)" "pgbouncer-oldname"
+check "network kept" kept "net_pgbouncer-oldname"
+check "postgres still attached" has "$(members pgbouncer-oldname)" "dokku.postgres.mydb"
+check "marker consumed" not marker oldname
+run_hook post-app-rename oldname newname
+check "rename hook exits 0" eq "$RC" "0"
+check "warns about the stale names" has "$OUT" "still uses the pgbouncer app 'oldname-pgbouncer'"
+check "prints the fix" has "$OUT" "dokku pgbouncer:connect newname mydb"
+
+# A real destroy after a rename must still clean up, i.e. the marker is
+# consumed rather than left behind to disable the hook for good.
+setup "a real destroy after a rename still cleans up"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+run_hook post-app-rename-setup myapp renamed
+run_hook post-delete myapp # the rename's destroy
+run_hook post-delete myapp # a later, genuine apps:destroy
+check "exits 0" eq "$RC" "0"
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+
+setup "rename hook clears a marker left by an aborted rename"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+run_hook post-app-rename-setup oldname newname
+run_hook post-app-rename oldname newname
+check "exits 0" eq "$RC" "0"
+check "marker cleared" not marker oldname
+
+setup "rename of an app without pgbouncer writes no marker"
+run_hook post-app-rename-setup myapp renamed
+check "exits 0" eq "$RC" "0"
+check "no marker" not marker myapp
+
+# --- 25. apps:clone must not inherit another app's pgbouncer -----------------
+setup "clone drops the inherited pgbouncer connection"
+touch "$STATE/app_clone" "$STATE/app_myapp-pgbouncer"
+printf 'myapp-pgbouncer.web' >"$STATE/cfg_clone_PGBOUNCER_HOST"
+printf 'postgres://postgres:secret123@myapp-pgbouncer.web:6432/mydb' >"$STATE/cfg_clone_PGBOUNCER_URL"
+printf '6432' >"$STATE/cfg_clone_PGBOUNCER_PORT"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp othernet' >"$STATE/apc_clone"
+run_hook post-app-clone-setup myapp clone
+check "exits 0" eq "$RC" "0"
+check "url dropped" eq "$(cfg clone PGBOUNCER_URL)" ""
+check "host dropped" eq "$(cfg clone PGBOUNCER_HOST)" ""
+check "port dropped" eq "$(cfg clone PGBOUNCER_PORT)" ""
+check "off the source app's private network" eq "$(apc clone)" "othernet"
+check "unset quietly" has "$(cat "$CALLS")" "dokku [quiet] config:unset"
+
+setup "clone of an app without pgbouncer is a no-op"
+touch "$STATE/app_clone"
+printf 'othernet' >"$STATE/apc_clone"
+run_hook post-app-clone-setup myapp clone
+check "exits 0" eq "$RC" "0"
+check "networks untouched" eq "$(apc clone)" "othernet"
 
 echo
 echo "passed: $PASS   failed: $FAIL"

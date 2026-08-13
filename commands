@@ -12,6 +12,11 @@ case "$1" in
     DB_SERVICE="$3"
     BOUNCER_APP="${MAIN_APP}-pgbouncer"
 
+    # The service name becomes DB_HOST, which the image interpolates into a
+    # printf format string, so it gets the same allowlist as the other
+    # identifiers rather than being trusted because it came from the operator.
+    assert_identifier_safe "postgres service name" "$DB_SERVICE"
+
     # Get DATABASE_URL from the main app (set by postgres:link)
     DATABASE_URL=$(dokku config:get "$MAIN_APP" DATABASE_URL) || dokku_log_fail "Failed to read DATABASE_URL from $MAIN_APP"
     [[ -z "$DATABASE_URL" ]] && dokku_log_fail "No DATABASE_URL found on $MAIN_APP. Link a postgres service first."
@@ -20,21 +25,26 @@ case "$1" in
     URL_BODY="${DATABASE_URL#postgres://}"
     URL_BODY="${URL_BODY#postgresql://}"
     [[ "$URL_BODY" == "$DATABASE_URL" ]] && dokku_log_fail "DATABASE_URL on $MAIN_APP is not a postgres:// URL"
-    [[ "$URL_BODY" != *@* ]] && dokku_log_fail "DATABASE_URL on $MAIN_APP has no credentials part"
 
-    # Split on the LAST @ so a password containing @ still parses
-    USERINFO="${URL_BODY%@*}"
-    HOSTINFO="${URL_BODY##*@}"
+    # Split the authority off at the first '/', then userinfo off at the last
+    # '@' inside it. Splitting the whole URL on its last '@' instead would let a
+    # database name containing an unencoded '@' — legal in a URI path — steal
+    # the split. A '/' cannot appear unencoded in userinfo, so the first '/'
+    # really is the end of the authority.
+    AUTHORITY="${URL_BODY%%/*}"
+    [[ "$AUTHORITY" != *@* ]] && dokku_log_fail "DATABASE_URL on $MAIN_APP has no credentials part"
+    USERINFO="${AUTHORITY%@*}"
+    HOSTPORT="${AUTHORITY##*@}"
+    URL_PATH="${URL_BODY#"$AUTHORITY"}"
 
     # pgbouncer opens the server-side connection itself, so it needs a password;
     # a userinfo without one cannot be made to work by this plugin.
     [[ "$USERINFO" == *:* ]] || dokku_log_fail "DATABASE_URL on $MAIN_APP has no password (expected postgres://user:password@host:port/dbname). Pgbouncer needs it to open connections to postgres."
-    DB_USER=$(urldecode "${USERINFO%%:*}") || dokku_log_fail "Failed to decode the user in DATABASE_URL"
-    DB_PASSWORD=$(urldecode "${USERINFO#*:}") || dokku_log_fail "Failed to decode the password in DATABASE_URL"
+    urldecode DB_USER "${USERINFO%%:*}" || dokku_log_fail "Failed to decode the user in DATABASE_URL"
+    urldecode DB_PASSWORD "${USERINFO#*:}" || dokku_log_fail "Failed to decode the password in DATABASE_URL"
 
-    [[ "$HOSTINFO" == */* ]] || dokku_log_fail "DATABASE_URL on $MAIN_APP has no database name (expected postgres://user:password@host:port/dbname)"
-    HOSTPORT="${HOSTINFO%%/*}"
-    DB_NAME_ENCODED="${HOSTINFO#*/}"
+    [[ "$URL_PATH" == /* ]] || dokku_log_fail "DATABASE_URL on $MAIN_APP has no database name (expected postgres://user:password@host:port/dbname)"
+    DB_NAME_ENCODED="${URL_PATH#/}"
     DB_QUERY=""
     if [[ "$DB_NAME_ENCODED" == *\?* ]]; then
       DB_QUERY="${DB_NAME_ENCODED#*\?}"
@@ -42,7 +52,7 @@ case "$1" in
     fi
     # The path is percent-encoded like the userinfo, so pgbouncer must be given
     # the decoded name. The encoded form is kept for building PGBOUNCER_URL.
-    DB_NAME=$(urldecode "$DB_NAME_ENCODED") || dokku_log_fail "Failed to decode the database name in DATABASE_URL"
+    urldecode DB_NAME "$DB_NAME_ENCODED" || dokku_log_fail "Failed to decode the database name in DATABASE_URL"
 
     if [[ "$HOSTPORT" == \[* ]]; then
       # IPv6 literal, e.g. [::1]:5432
@@ -57,7 +67,7 @@ case "$1" in
     fi
     [[ -z "$DB_PORT" ]] && DB_PORT="5432"
     # The port lands on the same unquoted pgbouncer.ini line as the values
-    # checked by assert_ini_safe below, so it needs a guard of its own.
+    # checked below, so it needs a guard of its own.
     [[ "$DB_PORT" =~ ^[0-9]+$ ]] || dokku_log_fail "DATABASE_URL on $MAIN_APP has a non-numeric port '$DB_PORT'"
 
     [[ -z "$DB_USER" ]] && dokku_log_fail "Failed to parse user from DATABASE_URL"
@@ -65,11 +75,11 @@ case "$1" in
     [[ -z "$DB_HOST" ]] && dokku_log_fail "Failed to parse host from DATABASE_URL"
     [[ -z "$DB_NAME" ]] && dokku_log_fail "Failed to parse database name from DATABASE_URL"
 
-    # All three are written into pgbouncer.ini unquoted, and all three are
-    # url-decoded above, so any of them can carry characters that break it.
-    assert_ini_safe "database password" "$DB_PASSWORD"
-    assert_ini_safe "database user" "$DB_USER"
-    assert_ini_safe "database name" "$DB_NAME"
+    # All three are url-decoded above, so any of them can carry characters that
+    # break the config the image generates from them.
+    assert_password_safe "$DB_PASSWORD"
+    assert_identifier_safe "database user" "$DB_USER"
+    assert_identifier_safe "database name" "$DB_NAME"
 
     # Credentials come from DATABASE_URL but the postgres host comes from the
     # service argument, so a wrong service silently pairs one service's
@@ -95,12 +105,18 @@ case "$1" in
       esac
     fi
 
-    BOUNCER_PORT="6432"
     BOUNCER_HOST="${BOUNCER_APP}.web"
-    # BOUNCER_HOST becomes a docker network alias, i.e. a single DNS label.
-    # Docker rejects the alias outright past 63 characters, which would fail
-    # much later and far from the cause.
-    [[ ${#BOUNCER_HOST} -gt 63 ]] && dokku_log_fail "The pgbouncer hostname '$BOUNCER_HOST' is ${#BOUNCER_HOST} characters, over the 63-character DNS limit. Use an app name of at most $((63 - ${#BOUNCER_HOST} + ${#MAIN_APP})) characters."
+    # BOUNCER_HOST becomes a docker network alias. Docker validates it as a
+    # hostname, so the limit that bites is 63 characters per DNS *label* —
+    # '<app>-pgbouncer' is the long one, '.web' is a second label.
+    [[ ${#BOUNCER_APP} -gt 63 ]] && dokku_log_fail "The pgbouncer app name '$BOUNCER_APP' is ${#BOUNCER_APP} characters, over the 63-character DNS label limit. Use an app name of at most $((63 - ${#BOUNCER_APP} + ${#MAIN_APP})) characters."
+
+    # 'ps:restart' below is what makes the app's containers join the network,
+    # and dokku's restart is a no-op that *succeeds* on an app with no
+    # deployment. Without this check that turns into a confusing rollback three
+    # steps later, blaming the network for a missing deploy.
+    MAIN_APP_DEPLOYED=$(dokku ps:report "$MAIN_APP" --deployed 2>/dev/null) || MAIN_APP_DEPLOYED="unknown"
+    [[ "$MAIN_APP_DEPLOYED" == "false" ]] && dokku_log_fail "App $MAIN_APP has no deployment yet. Deploy it first: its containers have to be recreated to join the pgbouncer network, and there are none to recreate."
 
     # The postgres container must exist before we can attach it or borrow its
     # image for the probe below.
@@ -177,7 +193,7 @@ case "$1" in
     # failure after this point so a half-applied setup is not left behind for
     # whoever deploys the app next.
     rollback_main_app() {
-      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_warn "Failed to unset pgbouncer env vars on $MAIN_APP"
+      quiet_dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_warn "Failed to unset pgbouncer env vars on $MAIN_APP"
       if [[ "$MAIN_APP_NETWORK_ADDED" == "true" ]]; then
         # shellcheck disable=SC2086
         dokku network:set "$MAIN_APP" attach-post-create $ORIGINAL_MAIN_APP_NETWORKS || dokku_log_warn "Failed to restore attach-post-create networks of $MAIN_APP"
@@ -215,10 +231,16 @@ case "$1" in
     # half-reconfigured. Services are restored first so the app is restarted
     # against a postgres that is reachable again.
     fail_and_rollback() {
+      trap - INT TERM
       rollback_services
       rollback_main_app
       dokku_log_fail "$1"
     }
+
+    # Ctrl-C from here on would otherwise leave the half-applied setup this
+    # whole apparatus exists to prevent: network attached, the postgres service
+    # claimed, a previous service released, and nothing left to undo it.
+    trap 'fail_and_rollback "Interrupted"' INT TERM
 
     # Repointing this app at a different postgres service leaves the old
     # service attached to our network and its post-start-network still pointing
@@ -275,25 +297,89 @@ case "$1" in
       NEW_CONTAINER_CONNECTED=true
     fi
 
+    # Clear the DATABASES_* config an older version of this plugin set for the
+    # pgbouncer/pgbouncer image. The current image ignores those names, but
+    # DATABASES_PASSWORD would otherwise sit in 'dokku config:show' forever.
+    quiet_dokku config:unset --no-restart "$BOUNCER_APP" "${PGBOUNCER_LEGACY_VARS[@]}" ||
+      dokku_log_warn "Failed to clear the legacy DATABASES_* config on $BOUNCER_APP, continuing"
+
     # Config plus the metadata pgbouncer:disconnect needs to undo everything.
-    # DATABASES_DBNAME is the name the image's entrypoint reads (not DATABASES_DB).
-    # Deliberately NOT --no-restart: git:from-image below skips the deploy when
-    # the image is unchanged, so on a re-run (e.g. rotated credentials) this
-    # restart is the only thing that applies the new values. On the first run
-    # the app is not deployed yet, so nothing restarts.
+    # Setting DB_* rather than DATABASE_URL keeps the image's entrypoint away
+    # from its own URL parser, which splits on ':' with cut and would truncate
+    # any password containing one.
+    #
+    # AUTH_TYPE: the image would default to md5, and the image this plugin used
+    # before defaulted to 'any' — no client authentication at all on the shared
+    # network. scram-sha-256 makes the entrypoint store the password in
+    # userlist.txt in plain form, which is what lets pgbouncer authenticate both
+    # the client and its own connection to a modern postgres.
+    #
+    # ADMIN_USERS names a user that does not exist, on purpose. The image
+    # defaults it to 'postgres', which is also the user dokku-postgres creates —
+    # that would hand pgbouncer's admin console (SHUTDOWN, PAUSE, KILL) to
+    # anything holding the app's own database credentials, i.e. to the app.
+    #
+    # --no-restart throughout: the deploy step below decides whether the new
+    # values are applied by a deploy or by an explicit restart. Letting
+    # config:set restart as a side effect made that ordering invisible.
     dokku_log_info1 "Setting pgbouncer config"
-    dokku config:set "$BOUNCER_APP" \
-      DATABASES_HOST="dokku.postgres.${DB_SERVICE}" \
-      DATABASES_USER="$DB_USER" \
-      DATABASES_PASSWORD="$DB_PASSWORD" \
-      DATABASES_PORT="$DB_PORT" \
-      DATABASES_DBNAME="$DB_NAME" \
+    quiet_dokku config:set --no-restart "$BOUNCER_APP" \
+      DB_HOST="dokku.postgres.${DB_SERVICE}" \
+      DB_USER="$DB_USER" \
+      DB_PASSWORD="$DB_PASSWORD" \
+      DB_PORT="$DB_PORT" \
+      DB_NAME="$DB_NAME" \
+      LISTEN_PORT="$BOUNCER_PORT" \
+      AUTH_TYPE="scram-sha-256" \
+      ADMIN_USERS="pgbouncer-admin-disabled" \
       DOKKU_PGBOUNCER_DB_SERVICE="$DB_SERVICE" \
       DOKKU_PGBOUNCER_NETWORK="$NETWORK_NAME" \
       || fail_and_rollback "Failed to set pgbouncer config on $BOUNCER_APP"
 
-    dokku_log_info1 "Deploying pgbouncer image"
-    dokku git:from-image "$BOUNCER_APP" "$PGBOUNCER_IMAGE" || fail_and_rollback "Failed to deploy pgbouncer image"
+    # Tunables, applied only where the operator has not already chosen a value.
+    TUNING_TO_SET=()
+    for tuning_pair in "${PGBOUNCER_TUNING_DEFAULTS[@]}"; do
+      [[ -n "$(dokku config:get "$BOUNCER_APP" "${tuning_pair%%=*}" 2>/dev/null || true)" ]] && continue
+      TUNING_TO_SET+=("$tuning_pair")
+    done
+    if [[ ${#TUNING_TO_SET[@]} -gt 0 ]]; then
+      dokku_log_info1 "Applying pgbouncer tuning defaults"
+      dokku config:set --no-restart "$BOUNCER_APP" "${TUNING_TO_SET[@]}" || fail_and_rollback "Failed to set pgbouncer tuning defaults on $BOUNCER_APP"
+    fi
+
+    # 'dokku git:from-image' commits a Dockerfile whose entire content is
+    # "FROM <image>" plus a fixed label. When that matches the previous commit —
+    # exactly what a re-run against the same pinned image produces — dokku logs
+    # "No changes detected" and returns non-zero. Treating that as a deploy
+    # failure is what used to make every re-run of pgbouncer:connect roll a
+    # working setup back onto direct postgres. DOKKU_PGBOUNCER_IMAGE records
+    # what is actually deployed, so bumping the pin still triggers a deploy.
+    deploy_bouncer_image() {
+      local out status=0
+      out=$(dokku git:from-image "$BOUNCER_APP" "$PGBOUNCER_IMAGE" 2>&1) || status=$?
+      printf '%s\n' "$out"
+      [[ "$status" -eq 0 ]] && return 0
+      # Insurance for an app deployed by an older version of this plugin, which
+      # left no DOKKU_PGBOUNCER_IMAGE to compare against.
+      if [[ "$out" == *"No changes detected"* ]]; then
+        dokku_log_info1 "$BOUNCER_APP already runs $PGBOUNCER_IMAGE, restarting it with the current config"
+        dokku ps:restart "$BOUNCER_APP"
+        return
+      fi
+      return "$status"
+    }
+
+    BOUNCER_DEPLOYED=$(dokku ps:report "$BOUNCER_APP" --deployed 2>/dev/null) || BOUNCER_DEPLOYED="unknown"
+    DEPLOYED_IMAGE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_IMAGE 2>/dev/null || true)
+    if [[ "$BOUNCER_DEPLOYED" == "true" && "$DEPLOYED_IMAGE" == "$PGBOUNCER_IMAGE" ]]; then
+      dokku_log_info1 "$BOUNCER_APP already runs $PGBOUNCER_IMAGE, restarting it with the current config"
+      dokku ps:restart "$BOUNCER_APP" || fail_and_rollback "Failed to restart $BOUNCER_APP"
+    else
+      dokku_log_info1 "Deploying pgbouncer image"
+      deploy_bouncer_image || fail_and_rollback "Failed to deploy pgbouncer image"
+      dokku config:set --no-restart "$BOUNCER_APP" DOKKU_PGBOUNCER_IMAGE="$PGBOUNCER_IMAGE" ||
+        dokku_log_warn "Failed to record the deployed image on $BOUNCER_APP; the next connect will redeploy it"
+    fi
 
     # Verify the database is actually usable THROUGH pgbouncer before pointing
     # the main app at it. A TCP connect is not enough: pgbouncer accepts
@@ -347,16 +433,14 @@ case "$1" in
       dokku_log_warn "Output: $VERIFY_OUTPUT"
       dokku_log_warn "$MAIN_APP is being left on DATABASE_URL (direct postgres)."
       dokku_log_warn "Check: dokku logs $BOUNCER_APP, docker network inspect ${NETWORK_NAME}"
-      rollback_services
-      rollback_main_app
-      dokku_log_fail "Pgbouncer verification failed"
+      fail_and_rollback "Pgbouncer verification failed"
     fi
 
     # Publish pgbouncer connection info on the main app and restart it.
     # DATABASE_URL (direct postgres) is left untouched — the app decides
     # which connection to use based on PGBOUNCER_URL being set.
     dokku_log_info1 "Setting pgbouncer env vars on $MAIN_APP"
-    dokku config:set --no-restart "$MAIN_APP" \
+    quiet_dokku config:set --no-restart "$MAIN_APP" \
       PGBOUNCER_URL="$PGBOUNCER_URL" \
       PGBOUNCER_HOST="$BOUNCER_HOST" \
       PGBOUNCER_PORT="$BOUNCER_PORT" \
@@ -385,10 +469,19 @@ case "$1" in
     NETWORK_MEMBERS=$(docker network inspect "$NETWORK_NAME" --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}') ||
       fail_and_rollback "Failed to inspect network $NETWORK_NAME"
     if [[ $'\n'"$NETWORK_MEMBERS" != *$'\n'"${MAIN_APP}."* ]]; then
-      dokku_log_warn "$MAIN_APP containers are not attached to ${NETWORK_NAME}, rolling back to direct postgres"
-      fail_and_rollback "$MAIN_APP did not join network $NETWORK_NAME; the pgbouncer setup on $MAIN_APP was rolled back. Check: docker network inspect ${NETWORK_NAME}"
+      # An app scaled to zero has no containers to attach, which is not the
+      # same failure as an app whose containers came up on the wrong networks.
+      MAIN_APP_RUNNING=$(dokku ps:report "$MAIN_APP" --running 2>/dev/null) || MAIN_APP_RUNNING="unknown"
+      if [[ "$MAIN_APP_RUNNING" == "false" ]]; then
+        dokku_log_warn "$MAIN_APP has no running containers (scaled to zero?), so there is nothing attached to $NETWORK_NAME yet."
+        dokku_log_warn "They will join it when you scale the app up, because attach-post-create is set."
+      else
+        dokku_log_warn "$MAIN_APP containers are not attached to ${NETWORK_NAME}, rolling back to direct postgres"
+        fail_and_rollback "$MAIN_APP did not join network $NETWORK_NAME; the pgbouncer setup on $MAIN_APP was rolled back. Check: docker network inspect ${NETWORK_NAME}"
+      fi
     fi
 
+    trap - INT TERM
     dokku_log_info1 "Done! PGBOUNCER_URL is now set on $MAIN_APP"
     dokku_log_info1 "The app should use PGBOUNCER_URL instead of DATABASE_URL for pooled connections"
     ;;
@@ -397,18 +490,15 @@ case "$1" in
     [[ -z "$2" ]] && dokku_log_fail "Please specify a main app name"
     MAIN_APP="$2"
     DB_SERVICE="${3:-}"
-    BOUNCER_APP="${MAIN_APP}-pgbouncer"
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
 
     # The bouncer app name is derived from the app name, which may have changed
     # since connect (apps:rename). PGBOUNCER_HOST was recorded on the app
     # itself, so it survives the rename and still names the real bouncer app —
     # from which the network and service metadata below then follow.
-    STORED_HOST=$(dokku config:get "$MAIN_APP" PGBOUNCER_HOST 2>/dev/null || true)
-    if [[ -n "$STORED_HOST" && "${STORED_HOST%.web}" != "$BOUNCER_APP" ]] &&
-      dokku apps:exists "${STORED_HOST%.web}" >/dev/null 2>&1; then
-      dokku_log_info1 "$MAIN_APP records its pgbouncer as '${STORED_HOST%.web}' rather than $BOUNCER_APP (renamed app?), using that"
-      BOUNCER_APP="${STORED_HOST%.web}"
+    BOUNCER_APP=$(resolve_bouncer_app "$MAIN_APP")
+    if [[ "$BOUNCER_APP" != "${MAIN_APP}-pgbouncer" ]]; then
+      dokku_log_info1 "$MAIN_APP records its pgbouncer as '$BOUNCER_APP' rather than ${MAIN_APP}-pgbouncer (renamed app?), using that"
     fi
 
     if dokku apps:exists "$BOUNCER_APP" >/dev/null 2>&1; then
@@ -442,18 +532,11 @@ case "$1" in
     if dokku apps:exists "$MAIN_APP" >/dev/null 2>&1; then
       # Remove PGBOUNCER_URL from the app — the app falls back to DATABASE_URL
       dokku_log_info1 "Removing PGBOUNCER_URL from $MAIN_APP"
-      dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_fail "Failed to unset pgbouncer env vars on $MAIN_APP"
+      quiet_dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_fail "Failed to unset pgbouncer env vars on $MAIN_APP"
 
       # Detach our network from the main app, keeping any other networks it has
-      MAIN_APP_NETWORKS=$(dokku network:report "$MAIN_APP" --network-attach-post-create) || dokku_log_fail "Failed to read attach-post-create networks of $MAIN_APP"
-      REMAINING_NETWORKS=""
-      for net in $MAIN_APP_NETWORKS; do
-        [[ "$net" == "$NETWORK_NAME" ]] && continue
-        REMAINING_NETWORKS="$REMAINING_NETWORKS $net"
-      done
       dokku_log_info1 "Detaching network $NETWORK_NAME from $MAIN_APP"
-      # shellcheck disable=SC2086
-      dokku network:set "$MAIN_APP" attach-post-create $REMAINING_NETWORKS || dokku_log_fail "Failed to detach network from $MAIN_APP"
+      detach_app_network "$MAIN_APP" "$NETWORK_NAME" || dokku_log_fail "Failed to detach network from $MAIN_APP"
 
       # Not fatal: the remaining steps are exactly what was asked for, and they
       # are the only way to release the postgres service's single-valued
@@ -512,9 +595,19 @@ case "$1" in
   pgbouncer:info)
     [[ -z "$2" ]] && dokku_log_fail "Please specify a main app name"
     MAIN_APP="$2"
-    BOUNCER_APP="${MAIN_APP}-pgbouncer"
+    # Same rename-aware lookup as disconnect, so this keeps working after an
+    # apps:rename instead of reporting on an app that does not exist.
+    BOUNCER_APP=$(resolve_bouncer_app "$MAIN_APP")
 
-    dokku config:show "$BOUNCER_APP" | sed -E 's/^(DATABASES_PASSWORD:[[:space:]]*).*/\1[redacted]/' || dokku_log_fail "Failed to show config for $BOUNCER_APP. Is pgbouncer set up for this app?"
+    # DB_PASSWORD is the live secret; DATABASES_PASSWORD may linger from an
+    # older version of this plugin, and the URL rule covers anything else here
+    # that carries credentials in a postgres:// value.
+    dokku config:show "$BOUNCER_APP" |
+      sed -E \
+        -e 's/^(DB_PASSWORD:[[:space:]]*).*/\1[redacted]/' \
+        -e 's/^(DATABASES_PASSWORD:[[:space:]]*).*/\1[redacted]/' \
+        -e 's#(://[^:/@[:space:]]*:)[^@[:space:]]*@#\1[redacted]@#g' ||
+      dokku_log_fail "Failed to show config for $BOUNCER_APP. Is pgbouncer set up for this app?"
     ;;
 
   help | pgbouncer | pgbouncer:help)

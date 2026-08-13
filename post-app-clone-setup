@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Dokku calls this during 'apps:clone', after the source app's config and
+# properties have been copied onto the new app and before the clone deploys.
+#
+# PGBOUNCER_URL, PGBOUNCER_HOST and PGBOUNCER_PORT come along in that copy and
+# point at the *source* app's pgbouncer. So does attach-post-create, which
+# would put the clone on the source app's private network — giving it a working
+# route to another app's pooler and database. Strip both, and let the clone
+# fall back to the DATABASE_URL it also inherited.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
+
+NEW_APP="${2:-}"
+[[ -z "$NEW_APP" ]] && exit 0
+
+STORED_HOST=$(dokku config:get "$NEW_APP" PGBOUNCER_HOST 2>/dev/null || true)
+[[ -z "$STORED_HOST" ]] && exit 0
+SOURCE_BOUNCER_APP="${STORED_HOST%.web}"
+
+dokku_log_info1 "Removing the inherited pgbouncer connection from $NEW_APP; it belongs to $SOURCE_BOUNCER_APP"
+quiet_dokku config:unset --no-restart "$NEW_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT ||
+  dokku_log_warn "Failed to unset the inherited PGBOUNCER_* vars on $NEW_APP; unset them by hand before deploying it"
+
+NETWORK_NAME=$(dokku config:get "$SOURCE_BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+if [[ -n "$NETWORK_NAME" ]]; then
+  detach_app_network "$NEW_APP" "$NETWORK_NAME" ||
+    dokku_log_warn "Failed to detach $NEW_APP from the inherited network $NETWORK_NAME; detach it by hand: dokku network:set $NEW_APP attach-post-create"
+fi
+
+dokku_log_info1 "Run 'dokku pgbouncer:connect $NEW_APP <service>' to give $NEW_APP its own pgbouncer"
+
+# Never fail the clone over cleanup: dokku aborts apps:clone on a non-zero
+# trigger, and every step above reports its own failure.
+exit 0

@@ -7,6 +7,7 @@ A [Dokku](https://dokku.com/) plugin that runs [PgBouncer](https://www.pgbouncer
 - Dokku
 - [dokku-postgres](https://github.com/dokku/dokku-postgres) plugin
 - A postgres service already linked to your app via `dokku postgres:link`
+- The app deployed at least once (its containers have to be recreated to join the pgbouncer network)
 
 ## Installation
 
@@ -34,17 +35,17 @@ This will:
 
 1. Parse `DATABASE_URL` on your app to extract connection credentials
 2. Create a private docker network (`pgbouncer-myapp`) shared by your app, pgbouncer, and the postgres service
-3. Create a new dokku app (`myapp-pgbouncer`) running the `pgbouncer/pgbouncer` docker image, with its http proxy disabled
+3. Create a new dokku app (`myapp-pgbouncer`) running a pinned `edoburu/pgbouncer` image, with its http proxy disabled
 4. Verify the database is actually usable through pgbouncer — a real `SELECT 1` from a throwaway container — **before** touching your app
 5. Set `PGBOUNCER_URL`, `PGBOUNCER_HOST`, and `PGBOUNCER_PORT` on your app and restart it
 
-`DATABASE_URL` is left untouched — your app decides which connection to use, so make it prefer `PGBOUNCER_URL` when that variable is set. If anything fails, every change this command made is rolled back — the env vars, the network attachment, and the postgres service's `post-start-network` and network attachment — and the app keeps running on direct postgres.
+`DATABASE_URL` is left untouched — your app decides which connection to use, so make it prefer `PGBOUNCER_URL` when that variable is set. If anything fails, every change this command made is rolled back — the env vars, the network attachment, and the postgres service's `post-start-network` and network attachment — and the app keeps running on direct postgres. Interrupting the command with Ctrl-C rolls it back too.
 
 A plain TCP check would not be enough here: pgbouncer accepts clients as soon as it starts listening and only dials postgres on the first query, so wrong credentials or an unreachable postgres would pass a port check and then break your app at query time.
 
 **Note:** the connect step restarts your app so its containers join the shared network, which means a brief interruption. It is a restart from the existing image rather than a rebuild, so it cannot fail on an unrelated build problem.
 
-Re-running `pgbouncer:connect` is safe and is the supported way to apply changed credentials (e.g. after rotating the database password): the pgbouncer app is restarted with the current values parsed from `DATABASE_URL`. Re-running it against a *different* postgres service also releases the previous one (its `post-start-network` is cleared and its container detached), so the old service is not left permanently blocked from backing another pgbouncer. That release happens only after the new service has been checked for conflicts, and it is undone if a later step fails, so a rejected or failed repoint leaves your current setup running.
+Re-running `pgbouncer:connect` is safe and is the supported way to apply changed credentials (e.g. after rotating the database password): the pgbouncer app is restarted with the current values parsed from `DATABASE_URL`, and the image is only redeployed when the pinned version actually changed. Re-running it against a *different* postgres service also releases the previous one (its `post-start-network` is cleared and its container detached), so the old service is not left permanently blocked from backing another pgbouncer. That release happens only after the new service has been checked for conflicts, and it is undone if a later step fails, so a rejected or failed repoint leaves your current setup running.
 
 The service you name must be the one `DATABASE_URL` points at. Credentials come from the URL while the postgres hostname comes from the service argument, so naming the wrong service would otherwise hand pgbouncer one service's hostname with another's credentials; the plugin refuses when the two disagree.
 
@@ -58,11 +59,13 @@ The postgres service name is remembered from `pgbouncer:connect`; you only need 
 
 The teardown always runs to completion. If your app cannot be restarted — scaled to zero, never deployed, no longer building — the command warns and carries on rather than aborting, because the remaining steps are the only thing that releases the postgres service's `post-start-network`. It also works when the app itself is already gone, and it follows `PGBOUNCER_HOST` rather than the `<app>-pgbouncer` naming convention, so it still finds the right pgbouncer app after an `apps:rename`.
 
-### Destroying an app
+### Destroying, renaming and cloning an app
 
 `dokku apps:destroy <app>` cleans up on its own: a `post-delete` hook destroys the pgbouncer app, clears the postgres service's `post-start-network`, and removes the shared network. Without it, that single-valued property would keep pointing at a network nobody uses and permanently bar the service from backing another pgbouncer.
 
-`dokku apps:rename` is not handled automatically — renaming the pgbouncer app would mean destroying and redeploying it, dropping every pooled connection. The plugin warns and prints the two commands that bring the names back in line.
+`dokku apps:rename` keeps the setup running. Dokku implements a rename as create-new plus destroy-old, and that destroy fires the same `post-delete` hook for the old name — so a `post-app-rename-setup` hook marks the rename in progress and the teardown is skipped. The pgbouncer app, network and `PGBOUNCER_URL` host keep their old names, which is harmless (`disconnect` follows `PGBOUNCER_HOST`, not the naming convention), so the plugin only prints the two commands that bring the names back in line. It will not do that for you, because renaming the pgbouncer app means destroying and redeploying it, dropping every pooled connection.
+
+`dokku apps:clone` strips the inherited `PGBOUNCER_*` variables and the source app's private network from the clone, so it starts on direct `DATABASE_URL` instead of quietly routing through another app's pooler. Run `pgbouncer:connect` on the clone to give it its own.
 
 ### View pgbouncer configuration
 
@@ -72,34 +75,82 @@ dokku pgbouncer:info myapp
 
 ## Configuring PgBouncer
 
-You can tune pgbouncer by setting environment variables on the pgbouncer app directly:
+The plugin sets these defaults on first connect, and then never touches them again — so an override survives later `pgbouncer:connect` runs:
+
+| Variable | Default | Why |
+|---|---|---|
+| `POOL_MODE` | `transaction` | The mode that actually multiplexes. See below. |
+| `MAX_PREPARED_STATEMENTS` | `100` | Keeps prepared statements working in transaction mode |
+| `MAX_CLIENT_CONN` | `1000` | pgbouncer's own default of 100 caps the app well below what pooling is for |
+| `DEFAULT_POOL_SIZE` | `20` | Server connections per user/database pair |
 
 ```bash
-dokku config:set myapp-pgbouncer PGBOUNCER_DEFAULT_POOL_SIZE=40
-dokku config:set myapp-pgbouncer PGBOUNCER_MAX_CLIENT_CONN=200
+dokku config:set myapp-pgbouncer DEFAULT_POOL_SIZE=40
 ```
 
-See the [pgbouncer documentation](https://www.pgbouncer.org/config.html) for available settings.
+Any other [pgbouncer setting](https://www.pgbouncer.org/config.html) the image supports can be set the same way, as the un-prefixed upper-case name (`QUERY_TIMEOUT`, `SERVER_IDLE_TIMEOUT`, `LOG_CONNECTIONS`, …).
+
+Do **not** override `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` or `LISTEN_PORT`: `pgbouncer:connect` owns those, rewrites them on every run, and builds `PGBOUNCER_URL` from them.
+
+### About transaction pooling
+
+`POOL_MODE=transaction` is the default because session pooling — pgbouncer's own default — holds one postgres backend per client connection for that connection's entire life, which multiplexes nothing and makes the whole pooler close to pointless for a typical long-lived app.
+
+Transaction pooling gives up session-scoped state, which breaks:
+
+- `LISTEN` / `NOTIFY`
+- session-level advisory locks (transaction-level ones are fine)
+- `WITH HOLD` cursors
+- `SET` outside a transaction, and other session-level configuration
+- plain `WITH HOLD`-style server-side cursors (Django's `QuerySet.iterator()` on psycopg2)
+
+Prepared statements are handled — that is what `MAX_PREPARED_STATEMENTS` is for — but the rest are not. If your app needs any of them, switch back before it matters:
+
+```bash
+dokku config:set myapp-pgbouncer POOL_MODE=session
+```
+
+One more thing to know: pgbouncer rejects clients that send startup parameters it does not track, and by default it only tolerates `extra_float_digits`. If your client passes libpq's `options` (for example Django's `OPTIONS: {'options': '-c search_path=myschema'}`) the connection will fail with `unsupported startup parameter: options`. The plugin does **not** widen `IGNORE_STARTUP_PARAMETERS` for you, because ignoring that parameter would silently drop your `search_path` and point queries at the wrong schema — a failed connection is easier to diagnose than that. Opt in only if you know what your client is sending:
+
+```bash
+dokku config:set myapp-pgbouncer IGNORE_STARTUP_PARAMETERS=extra_float_digits,options
+```
 
 ## Limitations
 
 - A postgres service can only back **one** pgbouncer at a time: dokku-postgres's `post-start-network` property is single-valued, so a second app's `pgbouncer:connect` against the same service would silently break the first one on the next postgres restart. The plugin refuses to connect if the service's `post-start-network` is already set to another network, and `pgbouncer:disconnect` only clears the property if it still points at its own network.
-- The database user, name, and password may not contain quotes, whitespace, `=` or `\`, because the pgbouncer image writes all three unquoted into its generated `pgbouncer.ini`. The port must be numeric, for the same reason. Values generated by dokku-postgres are always safe.
-- App names are limited to 49 characters, because `<app>-pgbouncer.web` is used as a docker network alias and DNS labels stop at 63.
+- The database user and database name must match `[A-Za-z0-9_.-]+`. The image builds its config with a shell `printf` whose format string contains these values and greps `userlist.txt` with the user as a regex, so `%`, `\` and regex metacharacters are as dangerous there as quotes. The port must be numeric for the same reason. The password is less restricted — it only has to avoid quotes, whitespace and `\`, because it is written to `userlist.txt` rather than into the config. Values generated by dokku-postgres are always safe.
+- App names are limited to 53 characters, because `<app>-pgbouncer` is used as a docker network alias and DNS labels stop at 63.
 - A query string on `DATABASE_URL` (e.g. `?sslmode=require`) is not carried over to the pgbouncer connection; the plugin warns when it sees one. Traffic on both legs is plaintext within the private docker network.
 - The pgbouncer app is named `<app>-pgbouncer` by convention. If an app of that name already exists with something deployed to it and was not created by this plugin, `connect` refuses to overwrite it and `disconnect` refuses to destroy it.
 
 ## Security notes
 
-- The pgbouncer image defaults to `auth_type = any`, meaning clients on the shared docker network connect without password authentication. The network only contains your app, pgbouncer, and the postgres service, but keep this in mind before attaching anything else to it.
-- `PGBOUNCER_URL` includes the database password (same as `DATABASE_URL`), so it keeps working if you tighten `PGBOUNCER_AUTH_TYPE` later — though `md5`/`scram` also require mounting a `userlist.txt` into the pgbouncer container, which this plugin does not do for you.
+- Clients must authenticate: the plugin sets `AUTH_TYPE=scram-sha-256`, and the image writes the database credentials to a `userlist.txt` rather than into `pgbouncer.ini`. Nothing on the shared network can connect to your database without the password.
+- pgbouncer's admin console is closed off by pointing `ADMIN_USERS` at a user that does not exist. The image would default it to `postgres`, which is the user dokku-postgres creates — that would let anything holding the app's own credentials (including the app) run `SHUTDOWN` or `PAUSE` against the pooler.
+- The database password is kept out of process arguments, out of the generated pgbouncer config, and out of the plugin's own output: every `dokku config:set` that carries it runs with `DOKKU_QUIET_OUTPUT=1`, because dokku otherwise echoes the values it sets. `pgbouncer:info` redacts it. It is still visible to root via `docker inspect` and `dokku config:show`, the same as `DATABASE_URL`.
+- `PGBOUNCER_URL` includes the database password, same as `DATABASE_URL`.
 - The pgbouncer app's http proxy is disabled so nginx never routes outside traffic to it.
 
 ## How it works
 
-The plugin deploys pgbouncer as a separate dokku app using a pinned `pgbouncer/pgbouncer` docker image, configured entirely through `DATABASES_*` environment variables. A dedicated docker network connects the three parties: the app and pgbouncer join it via dokku's `attach-post-create` (merged with any networks the app already uses), and the postgres container is connected directly plus via `post-start-network` so it rejoins after restarts. The app keeps its original `DATABASE_URL`; pgbouncer is offered alongside it as `PGBOUNCER_URL`, so switching is an app-level decision and disconnecting is always safe.
+The plugin deploys pgbouncer as a separate dokku app using a pinned `edoburu/pgbouncer` image, configured entirely through environment variables. The image is pinned rather than tracking `latest`, and is published for both amd64 and arm64.
 
-The plugin is four files: `commands` (the three subcommands), `functions` (helpers shared with the hooks), and the `post-delete` and `post-app-rename` triggers.
+The credentials are passed as discrete `DB_*` variables rather than as a URL: the image can parse a `DATABASE_URL` itself, but does it with `cut -d:`, which silently truncates any password containing a colon.
+
+A dedicated docker network connects the three parties: the app and pgbouncer join it via dokku's `attach-post-create` (merged with any networks the app already uses), and the postgres container is connected directly plus via `post-start-network` so it rejoins after restarts. The app keeps its original `DATABASE_URL`; pgbouncer is offered alongside it as `PGBOUNCER_URL`, so switching is an app-level decision and disconnecting is always safe.
+
+The plugin is six files: `commands` (the three subcommands), `functions` (helpers shared with the hooks), and the `post-delete`, `post-app-rename-setup`, `post-app-rename` and `post-app-clone-setup` triggers.
+
+## Upgrading from 0.1.x
+
+0.1.x ran `pgbouncer/pgbouncer:1.15.0`, an amd64-only image last built in 2020, with no client authentication and in session-pooling mode. Re-run `pgbouncer:connect` for each app to move it across:
+
+```bash
+dokku pgbouncer:connect myapp my-database
+```
+
+That redeploys the new image, switches the app to authenticated transaction pooling, and clears the old `DATABASES_*` config — including the plaintext `DATABASES_PASSWORD` that 0.1.x left in `dokku config:show`. Read the transaction-pooling caveats above first; add `dokku config:set myapp-pgbouncer POOL_MODE=session` beforehand to keep the old behaviour.
 
 ## Tests
 
@@ -108,6 +159,8 @@ The plugin is four files: `commands` (the three subcommands), `functions` (helpe
 ```bash
 bash tests/run.sh
 ```
+
+The `dokku` stub reproduces the real CLI's quirks where the plugin depends on them — notably that `git:from-image` *fails* when the image is unchanged, and that `ps:restart` succeeds without doing anything on an app that was never deployed.
 
 ## License
 

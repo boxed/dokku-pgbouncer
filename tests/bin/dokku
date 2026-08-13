@@ -2,7 +2,9 @@
 # Stub for the dokku CLI. State lives as files under $STATE; every call is
 # appended to $CALLS so tests can assert on the sequence.
 set -uo pipefail
-echo "dokku $*" >>"$CALLS"
+# The [quiet] marker records DOKKU_QUIET_OUTPUT, which is what stops real dokku
+# from echoing the values it sets — tests assert on it for secret-bearing calls.
+echo "dokku${DOKKU_QUIET_OUTPUT:+ [quiet]} $*" >>"$CALLS"
 
 key() { printf '%s' "$1" | tr -c 'a-zA-Z0-9._-' '_'; }
 
@@ -62,7 +64,15 @@ case "$cmd" in
     rm -f "$STATE/app_$(key "$1")" "$STATE/cfg_$(key "$1")_"*
     ;;
   ps:report)
-    f="$STATE/deployed_$(key "$1")"
+    app="$1"
+    case "${2:---deployed}" in
+      --deployed) f="$STATE/deployed_$(key "$app")" ;;
+      --running) f="$STATE/running_$(key "$app")" ;;
+      *)
+        echo "stub dokku: unhandled ps:report flag '$2'" >&2
+        exit 1
+        ;;
+    esac
     if [[ -e "$f" ]]; then cat "$f"; else exit 1; fi
     ;;
   ps:restart)
@@ -82,7 +92,23 @@ case "$cmd" in
     done
     ;;
   proxy:disable) fail_if_marked "proxy:disable_$1" ;;
-  git:from-image) fail_if_marked "git:from-image_$1" ;;
+  git:from-image)
+    app="$1" image="$2"
+    fail_if_marked "git:from-image_$app"
+    # Real dokku commits a Dockerfile whose whole content is "FROM <image>".
+    # When that is byte-identical to the last commit, its git-from-directory
+    # trigger logs exactly this and returns non-zero — which is why re-running
+    # connect against an unchanged pinned image used to look like a failure.
+    f="$STATE/fromimage_$(key "$app")"
+    if [[ -e "$f" && "$(cat "$f")" == "$image" ]]; then
+      echo " !     No changes detected, skipping git commit"
+      echo " !     Call 'ps:rebuild' on app to rebuild the app from existing source"
+      exit 1
+    fi
+    printf '%s' "$image" >"$f"
+    printf 'true' >"$STATE/deployed_$(key "$app")"
+    printf 'true' >"$STATE/running_$(key "$app")"
+    ;;
   network:exists) [[ -e "$STATE/net_$(key "$1")" ]] ;;
   network:create)
     fail_if_marked "network:create_$1"

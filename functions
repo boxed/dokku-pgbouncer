@@ -1,20 +1,87 @@
 # Helpers shared by 'commands' and the plugin's dokku triggers.
 # Sourced, never executed.
+#
+# shellcheck disable=SC2034 # the constants below are read by the sourcing script
 
-# Pinned: the pgbouncer/pgbouncer image reads DATABASES_* env vars whose names
-# are an implementation detail of its entrypoint, so "latest" could break us.
-PGBOUNCER_IMAGE="pgbouncer/pgbouncer:1.15.0"
+# Pinned. edoburu/pgbouncer publishes amd64 *and* arm64 and tracks upstream
+# pgbouncer closely. The image this plugin used before, pgbouncer/pgbouncer, is
+# amd64-only (so 'pgbouncer:connect' simply could not work on an arm64 dokku
+# host), was last built in 2020 on alpine 3.9, and its newest tag is pgbouncer
+# 1.15 — which predates max_prepared_statements and so cannot run transaction
+# pooling for any client that prepares statements.
+PGBOUNCER_IMAGE="edoburu/pgbouncer:v1.25.2-p0"
 
 # Client image for the 'SELECT 1' probe, used only when the postgres service's
 # own image (which is already on this host, and always has psql) cannot be read.
 PROBE_FALLBACK_IMAGE="postgres:16-alpine"
 
+# pgbouncer's own default port. The image would default to 5432 instead, so it
+# is passed explicitly as LISTEN_PORT: PGBOUNCER_URL is built from this constant
+# and must not be able to drift from what the container actually listens on.
+BOUNCER_PORT="6432"
+
+# Applied only to keys the pgbouncer app does not already have, so that
+# 'dokku config:set <app>-pgbouncer POOL_MODE=session' survives the next
+# 'pgbouncer:connect' instead of being silently reverted.
+#
+# POOL_MODE is the whole point of running a pooler. pgbouncer's own default is
+# 'session', which is what this plugin used to get by not setting anything at
+# all: one postgres backend pinned per client connection for its entire life,
+# multiplexing nothing. Transaction pooling costs session-scoped features —
+# LISTEN/NOTIFY, session-level advisory locks, WITH HOLD cursors, SET outside a
+# transaction — which is why it is a default here and not a fixed value.
+#
+# MAX_PREPARED_STATEMENTS is what keeps prepared statements working in
+# transaction mode (psycopg3, asyncpg, JDBC, Django's server-side binding). It
+# needs pgbouncer >= 1.21, which is a large part of why the image moved.
+#
+# IGNORE_STARTUP_PARAMETERS is deliberately left at the image's default of
+# extra_float_digits. Adding 'options' to it is the usual advice for clients
+# that libpq rejects otherwise, but ignoring it is not free: a client passing
+# '-c search_path=...' that way would connect happily and then read the wrong
+# schema. Failing the connection outright is the louder, more diagnosable of
+# the two, so widening this is left to whoever knows what their client sends.
+PGBOUNCER_TUNING_DEFAULTS=(
+  "POOL_MODE=transaction"
+  "MAX_PREPARED_STATEMENTS=100"
+  "MAX_CLIENT_CONN=1000"
+  "DEFAULT_POOL_SIZE=20"
+)
+
+# Left behind by versions of this plugin that ran pgbouncer/pgbouncer. They are
+# inert under the current image, but DATABASES_PASSWORD is a plaintext password
+# sitting in 'dokku config:show' forever, so connect clears them.
+PGBOUNCER_LEGACY_VARS=(DATABASES_HOST DATABASES_PORT DATABASES_USER DATABASES_PASSWORD DATABASES_DBNAME)
+
+PGBOUNCER_DATA_ROOT="${DOKKU_LIB_ROOT:-/var/lib/dokku}/data/pgbouncer"
+
+# dokku's config:set and config:unset echo every key *and value* they touch
+# unless DOKKU_QUIET_OUTPUT is set. The database password and the
+# password-bearing PGBOUNCER_URL both go through them, so every call carrying a
+# secret goes through here rather than straight to dokku — otherwise the
+# password lands in the operator's terminal and in whatever CI log captured it.
+quiet_dokku() {
+  DOKKU_QUIET_OUTPUT=1 dokku "$@"
+}
+
+# 'apps:rename' is implemented as create-new plus destroy-old, so dokku fires
+# the post-delete trigger for the *old* name in the middle of a rename.
+# Tearing the pgbouncer setup down there is exactly wrong: the renamed app is
+# still pointing at it. post-app-rename-setup runs before the destroy and drops
+# this marker so post-delete can tell a rename apart from a real apps:destroy.
+rename_marker() {
+  printf '%s/renaming.%s' "$PGBOUNCER_DATA_ROOT" "$1"
+}
+
 urldecode() {
-  # Decode %XX escapes (DATABASE_URL userinfo may be percent-encoded).
-  # Done char-by-char rather than via printf '%b', which would also interpret
-  # backslashes in the input and silently mangle a '%' not followed by two hex
-  # digits.
-  local encoded="$1" out="" i char hex
+  # Decode %XX escapes into the variable named by $1. Done char-by-char rather
+  # than via printf '%b', which would also interpret backslashes in the input
+  # and silently mangle a '%' not followed by two hex digits.
+  #
+  # The result is assigned rather than printed because "$(urldecode ...)" would
+  # strip trailing newlines, quietly turning a password ending in %0A into a
+  # different password — one that then passes the whitespace check below.
+  local __urldecode_var="$1" encoded="$2" out="" i char hex
   for ((i = 0; i < ${#encoded}; i++)); do
     char="${encoded:i:1}"
     if [[ "$char" == "%" ]]; then
@@ -30,16 +97,31 @@ urldecode() {
     fi
     out+="$char"
   done
-  printf '%s' "$out"
+  printf -v "$__urldecode_var" '%s' "$out"
 }
 
-assert_ini_safe() {
-  # The pgbouncer image writes these values unquoted into pgbouncer.ini, so
-  # characters that would break that line cannot be passed through safely.
+# The database user, the database name and the postgres service name are all
+# interpolated by the image's entrypoint into the *format string* of the printf
+# that generates pgbouncer.ini, and the user additionally into a grep regex
+# against userlist.txt. That makes '%', '\' and regex metacharacters every bit
+# as dangerous there as quotes, so these are checked against an allowlist rather
+# than against a list of known-bad characters. Everything dokku-postgres
+# generates matches.
+assert_identifier_safe() {
   local what="$1" value="$2"
-  case "$value" in
-    *"'"* | *'"'* | *[[:space:]]* | *=* | *\\*)
-      dokku_log_fail "The $what contains quotes, whitespace, '=' or '\\', which cannot be written safely into pgbouncer's config"
+  [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] ||
+    dokku_log_fail "The $what '$value' has characters this plugin cannot hand to pgbouncer safely; allowed are letters, digits, '_', '.' and '-'"
+}
+
+# The password never reaches pgbouncer.ini under this image: the entrypoint
+# writes it to userlist.txt as `"user" "password"` with echo, and puts only
+# auth_user in the config. Quotes, backslashes and whitespace are what break
+# that line; everything else survives verbatim, so unlike the identifiers above
+# this rules out only what actually breaks.
+assert_password_safe() {
+  case "$1" in
+    *"'"* | *'"'* | *[[:space:]]* | *\\*)
+      dokku_log_fail "The database password contains quotes, whitespace or '\\', which cannot be written safely into pgbouncer's userlist"
       ;;
   esac
 }
@@ -50,6 +132,34 @@ assert_ini_safe() {
 # perfectly valid setups.
 service_dns_host() {
   printf 'dokku-postgres-%s' "$(printf '%s' "$1" | tr '._/' '---')"
+}
+
+# The pgbouncer app is named <app>-pgbouncer by convention, but PGBOUNCER_HOST
+# is recorded on the main app itself and survives an apps:rename, so it is the
+# more reliable of the two pointers when they disagree.
+resolve_bouncer_app() {
+  local main_app="$1" derived="${1}-pgbouncer" stored
+  stored=$(dokku config:get "$main_app" PGBOUNCER_HOST 2>/dev/null || true)
+  stored="${stored%.web}"
+  if [[ -n "$stored" && "$stored" != "$derived" ]] && dokku apps:exists "$stored" >/dev/null 2>&1; then
+    printf '%s' "$stored"
+  else
+    printf '%s' "$derived"
+  fi
+}
+
+# Drop one network from an app's attach-post-create list, keeping every other
+# network the app was set up with.
+detach_app_network() {
+  local app="$1" network="$2" current remaining="" net
+  current=$(dokku network:report "$app" --network-attach-post-create) || return 1
+  [[ " $current " == *" $network "* ]] || return 0
+  for net in $current; do
+    [[ "$net" == "$network" ]] && continue
+    remaining="$remaining $net"
+  done
+  # shellcheck disable=SC2086
+  dokku network:set "$app" attach-post-create $remaining
 }
 
 container_on_network() {

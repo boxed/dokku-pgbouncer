@@ -16,6 +16,17 @@ APP="${1:-}"
 [[ -z "$APP" ]] && exit 0
 BOUNCER_APP="${APP}-pgbouncer"
 
+# 'apps:rename' destroys the old app as its middle step, so this trigger also
+# fires part-way through a rename — where tearing the setup down is exactly
+# wrong, because the renamed app is still pointing at it. post-app-rename-setup
+# runs before that destroy and leaves a marker to tell the two apart.
+MARKER="$(rename_marker "$APP")"
+if [[ -e "$MARKER" ]]; then
+  rm -f "$MARKER"
+  dokku_log_info1 "$APP is being renamed, leaving its pgbouncer setup in place"
+  exit 0
+fi
+
 # The marker is the only proof this plugin owns that app, exactly as in
 # pgbouncer:disconnect. Reading it before anything is destroyed also makes the
 # hook a no-op when dokku is destroying a pgbouncer app of ours (there is no
