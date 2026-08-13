@@ -132,10 +132,14 @@ case "$1" in
     # setup behind — in particular it must precede the detach of a previous
     # service below, or naming a taken service would tear down this app's
     # working pgbouncer and then abort.
-    CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
-      CURRENT_PSN=""
-      dokku_log_warn "Could not read post-start-network of $DB_SERVICE, assuming it is unset"
-    }
+    #
+    # A read that fails is not the same as an unset property — dokku prints
+    # nothing and succeeds for that — so it cannot be treated as one: of the two
+    # readings, "unset" is the one that goes on to claim a service that may
+    # already back another app's pgbouncer and break it on the next postgres
+    # restart. Refuse instead, before anything has changed.
+    CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) ||
+      dokku_log_fail "Could not read the post-start-network of postgres service $DB_SERVICE, so it cannot be told apart from a service that already backs another app's pgbouncer. Check: dokku postgres:info $DB_SERVICE --post-start-network"
     if [[ -n "$CURRENT_PSN" && "$CURRENT_PSN" != "$NETWORK_NAME" ]]; then
       dokku_log_fail "Postgres service $DB_SERVICE already has post-start-network '$CURRENT_PSN' (likely another app's pgbouncer). A postgres service can only back one pgbouncer at a time."
     fi
@@ -632,9 +636,13 @@ case "$1" in
     dokku_log_info1 "Detaching postgres service $DB_SERVICE from network"
     # post-start-network is single-valued and may have been repointed at
     # something else since connect; only clear it if it is still ours.
+    # Unreadable is left alone rather than cleared, the opposite of connect's
+    # choice: here the value may belong to another app's pgbouncer, and clearing
+    # that would break it. The cost is a property this teardown should have
+    # released, so say what to do about it.
     CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
       CURRENT_PSN=""
-      dokku_log_warn "Could not read post-start-network of $DB_SERVICE, leaving it alone"
+      dokku_log_warn "Could not read post-start-network of $DB_SERVICE, leaving it alone. If it still points at $NETWORK_NAME, $DB_SERVICE cannot back another pgbouncer until you clear it: dokku postgres:set $DB_SERVICE post-start-network \"\""
     }
     if [[ "$CURRENT_PSN" == "$NETWORK_NAME" ]]; then
       dokku postgres:set "$DB_SERVICE" post-start-network "" || dokku_log_warn "Failed to clear post-start-network on postgres service $DB_SERVICE, continuing"

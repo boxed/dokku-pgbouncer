@@ -323,6 +323,31 @@ check "explains the problem" has "$OUT" "did not join network"
 check "env vars rolled back" eq "$(cfg myapp PGBOUNCER_URL)" ""
 check "networks restored" eq "$(apc myapp)" "othernet"
 
+# An unreadable post-start-network cannot be read as "unset": that is the one
+# reading that goes on to claim a service which may already back another app.
+setup "connect refuses a service whose post-start-network cannot be read"
+printf 'othernet' >"$STATE/apc_myapp"
+touch "$STATE/net_othernet" "$STATE/pgfail_mydb"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "explains why" has "$OUT" "Could not read the post-start-network"
+check "nothing created" eq "$(apc myapp)" "othernet"
+check "no network created" not called "dokku network:create pgbouncer-myapp"
+check "no app created" not called "dokku apps:create myapp-pgbouncer"
+
+# The teardown paths make the opposite call: an unreadable value may be another
+# app's, so it is left alone — and the operator is told it may need clearing.
+setup "disconnect says what to do when post-start-network cannot be read"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/pgfail_mydb"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+run pgbouncer:disconnect myapp
+check "exits 0" eq "$RC" "0"
+check "left alone" eq "$(psn mydb)" "pgbouncer-myapp"
+check "tells the operator how to clear it" has "$OUT" "post-start-network \"\""
+check "teardown still finished" gone "app_myapp-pgbouncer"
+
 # --- 10. connect is idempotent with a stopped postgres container -------------
 setup "stopped postgres container already attached"
 touch "$STATE/net_pgbouncer-myapp" "$STATE/stopped_dokku.postgres.mydb"

@@ -64,7 +64,7 @@ dokku apps:destroy "$BOUNCER_APP" --force || dokku_log_warn "Failed to destroy $
 # at another app's pgbouncer since connect.
 CURRENT_PSN=$(dokku postgres:info "$DB_SERVICE" --post-start-network 2>/dev/null) || {
   CURRENT_PSN=""
-  dokku_log_warn "Could not read post-start-network of $DB_SERVICE, leaving it alone"
+  dokku_log_warn "Could not read post-start-network of $DB_SERVICE, leaving it alone. If it still points at $NETWORK_NAME, $DB_SERVICE cannot back another pgbouncer until you clear it: dokku postgres:set $DB_SERVICE post-start-network \"\""
 }
 if [[ "$CURRENT_PSN" == "$NETWORK_NAME" ]]; then
   dokku_log_info1 "Releasing postgres service $DB_SERVICE"
