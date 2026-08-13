@@ -372,6 +372,10 @@ case "$1" in
     # --no-restart throughout: the deploy step below decides whether the new
     # values are applied by a deploy or by an explicit restart. Letting
     # config:set restart as a side effect made that ordering invisible.
+    #
+    # quiet_dokku keeps the password out of the output, not out of 'ps': it goes
+    # on dokku's command line, because config:set takes values only as arguments.
+    # Unavoidable here, unlike in the probe below, which does have a choice.
     # Snapshot what this command owns on a pgbouncer app it configured before,
     # so rollback_bouncer_app can put the live pooler back. Read before the
     # rewrite below, and only for an app with our marker on it: for a fresh or
