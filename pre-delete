@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Dokku calls this before an app is destroyed, while the app still exists.
+#
+# post-delete cannot find the pgbouncer app of a *renamed* app. Every name this
+# plugin derives comes from the app name, and the one pointer that survives an
+# apps:rename — PGBOUNCER_HOST, recorded on the app itself — is gone by the time
+# post-delete runs. So 'dokku apps:destroy <renamed-app>' used to orphan the
+# pgbouncer app and the shared network, and leave the postgres service's
+# post-start-network pointing at a network nobody uses. That property is
+# single-valued, so the service was then permanently barred from backing another
+# pgbouncer, with no command left that would clean it up.
+#
+# Resolve the pointer here, while it can still be read, and leave the answer
+# where post-delete looks for it.
+#
+# Nothing in here may fail: dokku aborts the destroy — and an apps:rename, whose
+# middle step is a destroy — if a pre-delete trigger returns non-zero.
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
+
+APP="${1:-}"
+[[ -z "$APP" ]] && exit 0
+
+# Destroying the pooler out from under the app it serves is not something this
+# plugin can undo afterwards: the app keeps a PGBOUNCER_URL whose host stops
+# resolving, and neither the network nor the postgres service gets released.
+# 'pgbouncer:disconnect' unsets those variables before destroying the pgbouncer
+# app, so this only speaks up for a destroy that did not come from there.
+OWN_SERVICE=$(dokku config:get "$APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+OWN_NETWORK=$(dokku config:get "$APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+if [[ -n "$OWN_SERVICE" && -n "$OWN_NETWORK" ]]; then
+  SERVED_APP="${OWN_NETWORK#pgbouncer-}"
+  SERVED_HOST=$(dokku config:get "$SERVED_APP" PGBOUNCER_HOST 2>/dev/null || true)
+  if [[ "$SERVED_HOST" == "${APP}.web" ]]; then
+    dokku_log_warn "$APP is the pgbouncer app of $SERVED_APP, which still routes its database traffic through it."
+    dokku_log_warn "Destroying it leaves $SERVED_APP with a PGBOUNCER_URL that no longer resolves, and leaves network $OWN_NETWORK and postgres service $OWN_SERVICE attached to each other."
+    dokku_log_warn "The supported teardown is: dokku pgbouncer:disconnect $SERVED_APP"
+  fi
+  # A pgbouncer app of ours has no pgbouncer app of its own, so there is nothing
+  # further to record here.
+  exit 0
+fi
+
+BOUNCER_APP=$(resolve_bouncer_app "$APP")
+# post-delete derives this name by itself; a note would tell it nothing new.
+[[ "$BOUNCER_APP" == "${APP}-pgbouncer" ]] && exit 0
+
+DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+[[ -z "$DB_SERVICE" ]] && exit 0
+
+if ! mkdir -p "$PGBOUNCER_DATA_ROOT" 2>/dev/null ||
+  ! printf '%s' "$BOUNCER_APP" >"$(delete_note "$APP")" 2>/dev/null; then
+  dokku_log_warn "Could not write the pgbouncer delete note under $PGBOUNCER_DATA_ROOT."
+  dokku_log_warn "Destroying $APP will leave the pgbouncer app '$BOUNCER_APP', its network and postgres service $DB_SERVICE behind; clean up with: dokku pgbouncer:disconnect $APP $DB_SERVICE"
+fi
+
+exit 0

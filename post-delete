@@ -7,6 +7,10 @@
 # post-start-network pointing at a network nobody uses. That property is
 # single-valued, so the service is then permanently barred from backing another
 # pgbouncer, with no command left that would clean it up.
+#
+# The pgbouncer app's name is derived from the app name, which is not the name it
+# was created under if the app has since been renamed. pre-delete resolves that
+# while the app still exists and leaves the answer in a delete note.
 set -eo pipefail
 [[ $DOKKU_TRACE ]] && set -x
 source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
@@ -23,8 +27,23 @@ BOUNCER_APP="${APP}-pgbouncer"
 MARKER="$(rename_marker "$APP")"
 if [[ -e "$MARKER" ]]; then
   rm -f "$MARKER"
+  # Renaming an already-renamed app leaves a delete note from pre-delete that
+  # nothing else would consume; the setup it points at is staying put.
+  rm -f "$(delete_note "$APP")"
   dokku_log_info1 "$APP is being renamed, leaving its pgbouncer setup in place"
   exit 0
+fi
+
+# pre-delete resolves PGBOUNCER_HOST while the app still exists, which is the
+# only way to learn the pgbouncer app's real name after an apps:rename.
+NOTE="$(delete_note "$APP")"
+if [[ -e "$NOTE" ]]; then
+  NOTED_BOUNCER_APP=$(cat "$NOTE" 2>/dev/null || true)
+  rm -f "$NOTE"
+  if [[ -n "$NOTED_BOUNCER_APP" && "$NOTED_BOUNCER_APP" != "$BOUNCER_APP" ]]; then
+    dokku_log_info1 "$APP recorded its pgbouncer as '$NOTED_BOUNCER_APP' rather than $BOUNCER_APP (renamed app?), cleaning that up instead"
+    BOUNCER_APP="$NOTED_BOUNCER_APP"
+  fi
 fi
 
 # The marker is the only proof this plugin owns that app, exactly as in

@@ -30,6 +30,7 @@ setup() {
 }
 
 marker() { [[ -e "$STATE/data/pgbouncer/renaming.$1" ]]; }
+note() { [[ -e "$STATE/data/pgbouncer/deleting.$1" ]]; }
 
 run() {
   OUT=$("$ROOT/commands" "$@" 2>&1)
@@ -564,6 +565,86 @@ setup "post-delete is a no-op for the bouncer app itself"
 run_hook post-delete myapp-pgbouncer
 check "exits 0" eq "$RC" "0"
 check "did nothing" eq "$(cat "$CALLS")" "dokku config:get myapp-pgbouncer-pgbouncer DOKKU_PGBOUNCER_DB_SERVICE"
+
+# --- 20b. destroying a renamed app ------------------------------------------
+# post-delete can only derive '<app>-pgbouncer', which is not the name of the
+# pgbouncer app of an app that has been renamed — and by then PGBOUNCER_HOST,
+# the pointer that survives a rename, is gone with the app. pre-delete resolves
+# it while the app still exists.
+setup "post-delete cleans up after destroying a renamed app"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-oldname' >"$STATE/psn_mydb"
+printf 'dokku.postgres.mydb\n' >"$STATE/netmembers_pgbouncer-oldname"
+run_hook pre-delete newname some-image-tag
+check "pre-delete exits 0" eq "$RC" "0"
+check "note written" note newname
+rm -f "$STATE/app_newname" # dokku destroys the app between the two hooks
+run_hook post-delete newname
+check "post-delete exits 0" eq "$RC" "0"
+check "follows the note" has "$OUT" "recorded its pgbouncer as 'oldname-pgbouncer'"
+check "bouncer app destroyed" gone "app_oldname-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+check "container detached" hasnt "$(members pgbouncer-oldname)" "dokku.postgres.mydb"
+check "network destroyed" gone "net_pgbouncer-oldname"
+check "note consumed" not note newname
+
+setup "pre-delete writes no note when the derived name is still right"
+touch "$STATE/app_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+run_hook pre-delete myapp some-image-tag
+check "exits 0" eq "$RC" "0"
+check "no note" not note myapp
+
+setup "pre-delete is a no-op for an app without pgbouncer"
+run_hook pre-delete myapp some-image-tag
+check "exits 0" eq "$RC" "0"
+check "no note" not note myapp
+
+# Renaming an app that was already renamed once must still be recognised as a
+# rename, or the delete note would point post-delete at a live setup.
+setup "renaming an already-renamed app keeps its setup"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-oldname' >"$STATE/psn_mydb"
+run_hook post-app-rename-setup newname newname2
+check "setup hook exits 0" eq "$RC" "0"
+check "marker written for the current name" marker newname
+run_hook pre-delete newname some-image-tag
+run_hook post-delete newname
+check "post-delete exits 0" eq "$RC" "0"
+check "says it is a rename" has "$OUT" "being renamed"
+check "bouncer app kept" kept "app_oldname-pgbouncer"
+check "service still claimed" eq "$(psn mydb)" "pgbouncer-oldname"
+check "network kept" kept "net_pgbouncer-oldname"
+check "marker consumed" not marker newname
+check "note cleared too" not note newname
+
+# --- 20c. destroying the pooler itself --------------------------------------
+setup "pre-delete warns when the pgbouncer app itself is destroyed"
+touch "$STATE/app_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'myapp-pgbouncer.web' >"$STATE/cfg_myapp_PGBOUNCER_HOST"
+run_hook pre-delete myapp-pgbouncer some-image-tag
+check "exits 0" eq "$RC" "0"
+check "names the app it serves" has "$OUT" "pgbouncer app of myapp"
+check "points at the supported teardown" has "$OUT" "pgbouncer:disconnect myapp"
+check "no note for the pooler" not note myapp-pgbouncer
+
+# pgbouncer:disconnect unsets PGBOUNCER_HOST before destroying the pgbouncer
+# app, so the warning above must not fire on its way through.
+setup "pre-delete stays quiet when nothing points at the pooler any more"
+touch "$STATE/app_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+run_hook pre-delete myapp-pgbouncer some-image-tag
+check "exits 0" eq "$RC" "0"
+check "says nothing" hasnt "$OUT" "pgbouncer app of"
 
 # --- 21. bare command shows usage -------------------------------------------
 setup "bare pgbouncer command"

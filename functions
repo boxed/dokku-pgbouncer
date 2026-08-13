@@ -89,6 +89,15 @@ rename_marker() {
   printf '%s/renaming.%s' "$PGBOUNCER_DATA_ROOT" "$1"
 }
 
+# Written by pre-delete, consumed by post-delete: the name of the pgbouncer app
+# belonging to the app being destroyed. Needed because post-delete can only
+# derive '<app>-pgbouncer', which is the wrong name for an app that has been
+# renamed since connect — and by then the app is gone, so the PGBOUNCER_HOST
+# that records the real name can no longer be read.
+delete_note() {
+  printf '%s/deleting.%s' "$PGBOUNCER_DATA_ROOT" "$1"
+}
+
 urldecode() {
   # Decode %XX escapes into the variable named by $1. Done char-by-char rather
   # than via printf '%b', which would also interpret backslashes in the input

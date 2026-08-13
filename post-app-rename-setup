@@ -23,7 +23,11 @@ OLD_APP="${1:-}"
 [[ -z "$OLD_APP" ]] && exit 0
 
 # Nothing to protect unless this plugin actually owns a setup for the old name.
-DB_SERVICE=$(dokku config:get "${OLD_APP}-pgbouncer" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+# Resolved through PGBOUNCER_HOST rather than derived: an app renamed once
+# already has a pgbouncer app named after a name it no longer carries, and
+# renaming it again has to leave that setup alone just the same.
+BOUNCER_APP=$(resolve_bouncer_app "$OLD_APP")
+DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
 [[ -z "$DB_SERVICE" ]] && exit 0
 
 if ! mkdir -p "$PGBOUNCER_DATA_ROOT" 2>/dev/null || ! touch "$(rename_marker "$OLD_APP")" 2>/dev/null; then

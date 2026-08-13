@@ -63,7 +63,7 @@ The teardown always runs to completion. If your app cannot be restarted — scal
 
 ### Destroying, renaming and cloning an app
 
-`dokku apps:destroy <app>` cleans up on its own: a `post-delete` hook destroys the pgbouncer app, clears the postgres service's `post-start-network`, and removes the shared network. Without it, that single-valued property would keep pointing at a network nobody uses and permanently bar the service from backing another pgbouncer.
+`dokku apps:destroy <app>` cleans up on its own: a `post-delete` hook destroys the pgbouncer app, clears the postgres service's `post-start-network`, and removes the shared network. Without it, that single-valued property would keep pointing at a network nobody uses and permanently bar the service from backing another pgbouncer. A `pre-delete` hook runs first, while the app still exists, and writes down which pgbouncer app it actually owns — otherwise destroying a *renamed* app would find nothing under `<app>-pgbouncer` and orphan the lot. That hook also warns if you destroy the pgbouncer app itself while the app it serves is still routing through it.
 
 `dokku apps:rename` keeps the setup running. Dokku implements a rename as create-new plus destroy-old, and that destroy fires the same `post-delete` hook for the old name — so a `post-app-rename-setup` hook marks the rename in progress and the teardown is skipped. The pgbouncer app, network and `PGBOUNCER_URL` host keep their old names, which is harmless (`disconnect` follows `PGBOUNCER_HOST`, not the naming convention), so the plugin only prints the two commands that bring the names back in line. It will not do that for you, because renaming the pgbouncer app means destroying and redeploying it, dropping every pooled connection.
 
@@ -142,7 +142,7 @@ The credentials are passed as discrete `DB_*` variables rather than as a URL: th
 
 A dedicated docker network connects the three parties: the app and pgbouncer join it via dokku's `attach-post-create` (merged with any networks the app already uses), and the postgres container is connected directly plus via `post-start-network` so it rejoins after restarts. The app keeps its original `DATABASE_URL`; pgbouncer is offered alongside it as `PGBOUNCER_URL`, so switching is an app-level decision and disconnecting is always safe.
 
-The plugin is six files: `commands` (the three subcommands), `functions` (helpers shared with the hooks), and the `post-delete`, `post-app-rename-setup`, `post-app-rename` and `post-app-clone-setup` triggers.
+The plugin is seven files: `commands` (the three subcommands), `functions` (helpers shared with the hooks), and the `pre-delete`, `post-delete`, `post-app-rename-setup`, `post-app-rename` and `post-app-clone-setup` triggers.
 
 ## Upgrading from 0.1.x
 

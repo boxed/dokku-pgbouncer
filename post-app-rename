@@ -33,11 +33,16 @@ done
 # later genuine apps:destroy is not silently skipped.
 rm -f "$(rename_marker "$OLD_APP")" 2>/dev/null || true
 
-OLD_BOUNCER_APP="${OLD_APP}-pgbouncer"
-DB_SERVICE=$(dokku config:get "$OLD_BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
+# The old app is gone by now, so the pointer has to be read off the new one.
+# PGBOUNCER_HOST came along with the rename and still names the real pgbouncer
+# app, whether this is the app's first rename or its third.
+BOUNCER_APP=$(resolve_bouncer_app "$NEW_APP")
+DB_SERVICE=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_DB_SERVICE 2>/dev/null || true)
 [[ -z "$DB_SERVICE" ]] && exit 0
+NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+[[ -z "$NETWORK_NAME" ]] && NETWORK_NAME="pgbouncer-${OLD_APP}"
 
-dokku_log_warn "$NEW_APP still uses the pgbouncer app '$OLD_BOUNCER_APP' and network 'pgbouncer-${OLD_APP}', both named after '$OLD_APP'."
+dokku_log_warn "$NEW_APP still uses the pgbouncer app '$BOUNCER_APP' and network '$NETWORK_NAME', named after an earlier name of the app."
 dokku_log_warn "Pooling keeps working and disconnect still finds them, but to bring the names back in line:"
 dokku_log_warn "  dokku pgbouncer:disconnect $NEW_APP"
 dokku_log_warn "  dokku pgbouncer:connect $NEW_APP $DB_SERVICE"
