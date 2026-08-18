@@ -623,6 +623,10 @@ case "$1" in
     MAIN_APP="$2"
     DB_SERVICE="${3:-}"
     NETWORK_NAME="pgbouncer-${MAIN_APP}"
+    # Set by the steps that are allowed to fail without stopping the teardown, so
+    # the closing message names what is still left rather than reporting a clean
+    # finish over the top of a warning.
+    TEARDOWN_INCOMPLETE=false
     take_plugin_lock
 
     # The bouncer app name is derived from the app name, which may have changed
@@ -663,13 +667,25 @@ case "$1" in
     # is nothing to move back onto direct postgres — but the pgbouncer app,
     # network and post-start-network still need releasing.
     if dokku apps:exists "$MAIN_APP" >/dev/null 2>&1; then
-      # Remove PGBOUNCER_URL from the app — the app falls back to DATABASE_URL
+      # Remove PGBOUNCER_URL from the app — the app falls back to DATABASE_URL.
+      # The one step here that stays fatal: nothing has been torn down yet, so
+      # aborting leaves a working setup a retry can pick up again, while carrying
+      # on would destroy the pooler the app is still pointed at.
       dokku_log_info1 "Removing PGBOUNCER_URL from $MAIN_APP"
       quiet_dokku config:unset --no-restart "$MAIN_APP" PGBOUNCER_URL PGBOUNCER_HOST PGBOUNCER_PORT || dokku_log_fail "Failed to unset pgbouncer env vars on $MAIN_APP"
 
-      # Detach our network from the main app, keeping any other networks it has
+      # Detach our network from the main app, keeping any other networks it has.
+      # Not fatal, for the same reason as the restart below: the app is already
+      # off pgbouncer by this point, and everything after this is the release of
+      # resources that nothing else will release. A leftover attachment costs the
+      # app a network it does not use and blocks the destroy at the end, which
+      # says so; a teardown that stops here strands the pooler and the postgres
+      # service's single-valued post-start-network as well.
       dokku_log_info1 "Detaching network $NETWORK_NAME from $MAIN_APP"
-      detach_app_network "$MAIN_APP" "$NETWORK_NAME" || dokku_log_fail "Failed to detach network from $MAIN_APP"
+      if ! detach_app_network "$MAIN_APP" "$NETWORK_NAME"; then
+        TEARDOWN_INCOMPLETE=true
+        dokku_log_warn "Failed to detach network $NETWORK_NAME from $MAIN_APP; detach it by hand once the teardown is done: dokku network:set $MAIN_APP attach-post-create"
+      fi
 
       # Not fatal: the remaining steps are exactly what was asked for, and they
       # are the only way to release the postgres service's single-valued
@@ -721,12 +737,26 @@ case "$1" in
         dokku_log_info1 "Postgres container already off network $NETWORK_NAME"
       fi
       dokku_log_info1 "Removing network: $NETWORK_NAME"
-      dokku network:destroy "$NETWORK_NAME" --force || dokku_log_fail "Failed to destroy network $NETWORK_NAME. Check: docker network inspect $NETWORK_NAME"
+      # This is the step that fails when the app could not be restarted above:
+      # its containers are still endpoints, and docker refuses to remove a
+      # network that has any. Everything the teardown had to release has been
+      # released by then, and re-running disconnect finishes the job once they
+      # are gone — so failing the whole command here would only take a complete
+      # teardown and report it as a failed one.
+      if ! dokku network:destroy "$NETWORK_NAME" --force; then
+        TEARDOWN_INCOMPLETE=true
+        dokku_log_warn "Failed to destroy network $NETWORK_NAME; containers are probably still attached to it. Check: docker network inspect $NETWORK_NAME"
+      fi
     else
       dokku_log_info1 "Network $NETWORK_NAME does not exist, skipping"
     fi
 
-    dokku_log_info1 "Done! $MAIN_APP is back on direct postgres"
+    if [[ "$TEARDOWN_INCOMPLETE" == "true" ]]; then
+      dokku_log_info1 "$MAIN_APP is back on direct postgres, and the postgres service is released."
+      dokku_log_warn "The teardown left something behind, listed above. Re-run it once that is dealt with: dokku pgbouncer:disconnect $MAIN_APP $DB_SERVICE"
+    else
+      dokku_log_info1 "Done! $MAIN_APP is back on direct postgres"
+    fi
     ;;
 
   pgbouncer:info)

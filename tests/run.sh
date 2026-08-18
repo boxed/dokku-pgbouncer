@@ -542,6 +542,57 @@ check "service released" eq "$(psn mydb)" ""
 check "bouncer app destroyed" gone "app_myapp-pgbouncer"
 check "network destroyed" gone "net_pgbouncer-myapp"
 
+# Removing the network is the step that fails when the app could not be
+# restarted: its containers are still endpoints, and docker refuses to remove a
+# network that has any. The pooler is destroyed and the service released by then,
+# so failing here reported a finished teardown as a failed one.
+setup "disconnect reports what is left rather than failing at the last step"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/fail_network_destroy_pgbouncer-myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'x' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+run pgbouncer:disconnect myapp
+check "exits 0" eq "$RC" "0"
+check "url removed" eq "$(cfg myapp PGBOUNCER_URL)" ""
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+check "names what is left" has "$OUT" "Failed to destroy network pgbouncer-myapp"
+check "does not claim a clean finish" hasnt "$OUT" "Done!"
+check "says how to finish it" has "$OUT" "dokku pgbouncer:disconnect myapp mydb"
+
+# Same reasoning one step earlier: the app is off pgbouncer by then, and the
+# release of the pooler and the postgres service is what nothing else will do.
+setup "disconnect finishes the teardown when the network cannot be detached"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/fail_network_set_myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'x' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+run pgbouncer:disconnect myapp
+check "exits 0" eq "$RC" "0"
+check "warns about the detach" has "$OUT" "Failed to detach network"
+check "url still removed" eq "$(cfg myapp PGBOUNCER_URL)" ""
+check "bouncer app destroyed" gone "app_myapp-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+
+# Taking the app off pgbouncer is the one step that stays fatal: nothing has been
+# torn down yet, so a retry picks the whole thing up again, while carrying on
+# would destroy the pooler the app is still pointed at.
+setup "disconnect stops if the app cannot be taken off pgbouncer"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/fail_config_unset_myapp"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'x' >"$STATE/cfg_myapp_PGBOUNCER_URL"
+run pgbouncer:disconnect myapp
+check "fails" eq "$RC" "1"
+check "pooler left alone" kept "app_myapp-pgbouncer"
+check "service still claimed" eq "$(psn mydb)" "pgbouncer-myapp"
+check "app still pooled" eq "$(cfg myapp PGBOUNCER_URL)" "x"
+
 setup "disconnect after the app was destroyed by hand"
 rm -f "$STATE/app_myapp"
 touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
