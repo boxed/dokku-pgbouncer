@@ -874,6 +874,30 @@ check "names what breaks" has "$OUT" "LISTEN/NOTIFY"
 check "says how to keep it" has "$OUT" "POOL_MODE=session"
 check "transaction pooling applied" eq "$(cfg myapp-pgbouncer POOL_MODE)" "transaction"
 
+# That upgrade is a change of behaviour, so a run that fails must not leave it
+# behind: putting the pooler's own config back while keeping the POOL_MODE this
+# run introduced would restart the restored pooler in transaction mode anyway.
+setup "a failed upgrade does not leave transaction pooling behind"
+touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp" "$STATE/failverify"
+printf 'true' >"$STATE/deployed_myapp-pgbouncer"
+printf 'mydb' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-myapp' >"$STATE/cfg_myapp-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-myapp' >"$STATE/psn_mydb"
+printf 'pgbouncer-myapp' >"$STATE/apc_myapp"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "pool mode back to unset, i.e. session" eq "$(cfg myapp-pgbouncer POOL_MODE)" ""
+check "the other defaults are withdrawn too" eq "$(cfg myapp-pgbouncer MAX_CLIENT_CONN)" ""
+
+# A fresh pooler has no previous configuration to go back to, so there is nothing
+# to withdraw either — and asking for it would only restart a pooler that has
+# just failed verification.
+setup "a failed first connect does not try to restore a fresh pooler"
+touch "$STATE/failverify"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "nothing restored" hasnt "$OUT" "Restoring the previous configuration"
+
 setup "a first connect does not warn about pool mode"
 run pgbouncer:connect myapp mydb
 check "exits 0" eq "$RC" "0"

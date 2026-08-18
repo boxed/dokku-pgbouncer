@@ -450,6 +450,16 @@ case "$1" in
     for tuning_pair in "${PGBOUNCER_TUNING_DEFAULTS[@]}"; do
       [[ -n "$(dokku config:get "$BOUNCER_APP" "${tuning_pair%%=*}" 2>/dev/null || true)" ]] && continue
       TUNING_TO_SET+=("$tuning_pair")
+      # The key had no value a moment ago, so a rollback has to take it away
+      # again rather than leave the restored pooler running with a setting it
+      # never had — most of all POOL_MODE, whose default here is the change of
+      # behaviour warned about just below. Recorded only for a pooler this plugin
+      # configured before, for the same reason as the snapshot above: a fresh or
+      # adopted app is not put back at all, and asking for one to be would only
+      # restart a pooler that has just failed verification.
+      if [[ -n "$PREVIOUS_SERVICE" ]]; then
+        BOUNCER_RESTORE_UNSET+=("${tuning_pair%%=*}")
+      fi
       # A pgbouncer app this plugin already configured, yet with no POOL_MODE, was
       # set up by a version that left pgbouncer at its own default of session
       # pooling. Transaction pooling is the right default for a new setup but a
