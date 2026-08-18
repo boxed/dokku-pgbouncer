@@ -10,8 +10,22 @@ case "$1" in
     [[ -z "$3" ]] && dokku_log_fail "Please specify a postgres service name"
     MAIN_APP="$2"
     DB_SERVICE="$3"
-    BOUNCER_APP="${MAIN_APP}-pgbouncer"
     take_plugin_lock
+
+    # The pgbouncer app is named <app>-pgbouncer by convention, but an app that
+    # has been renamed since its first connect owns a pooler named after a name it
+    # no longer carries. PGBOUNCER_HOST, recorded on the app itself, came along
+    # with the rename and still names the real one, which is why disconnect, info
+    # and the delete hooks all follow it. Deriving the name here instead made
+    # re-running connect — the documented way to apply rotated credentials — abort
+    # at the post-start-network check below, reporting this app's own claim on the
+    # service as "likely another app's pgbouncer"; and if that claim had since been
+    # cleared by hand, build a second pooler beside the running one and overwrite
+    # the only pointer left to the first.
+    BOUNCER_APP=$(resolve_bouncer_app "$MAIN_APP")
+    if [[ "$BOUNCER_APP" != "${MAIN_APP}-pgbouncer" ]]; then
+      dokku_log_info1 "$MAIN_APP records its pgbouncer as '$BOUNCER_APP' rather than ${MAIN_APP}-pgbouncer (renamed app?), reusing that"
+    fi
 
     # The service name becomes DB_HOST, which the image interpolates into a
     # printf format string, so it gets the same allowlist as the other
@@ -124,7 +138,18 @@ case "$1" in
     docker inspect --format '{{.Id}}' "dokku.postgres.${DB_SERVICE}" >/dev/null 2>&1 ||
       dokku_log_fail "No container 'dokku.postgres.${DB_SERVICE}' found. Does postgres service '$DB_SERVICE' exist and has it been started?"
 
-    NETWORK_NAME="pgbouncer-${MAIN_APP}"
+    # The network is named after the app too, and has drifted with the same
+    # renames, so it is read off the pooler wherever there is one to read it from
+    # and only derived for a setup that does not exist yet. Deriving it for an
+    # existing setup would point this run at a network that setup does not use:
+    # the check below would then read the app's own claim on the postgres service
+    # as a stranger's, and a run that got past it would migrate a working pooler
+    # onto a second network for no reason.
+    NETWORK_NAME=""
+    if dokku apps:exists "$BOUNCER_APP" >/dev/null 2>&1; then
+      NETWORK_NAME=$(dokku config:get "$BOUNCER_APP" DOKKU_PGBOUNCER_NETWORK 2>/dev/null || true)
+    fi
+    [[ -z "$NETWORK_NAME" ]] && NETWORK_NAME="pgbouncer-${MAIN_APP}"
 
     # post-start-network is single-valued: overwriting another value would
     # silently detach whatever set it (e.g. another app's pgbouncer) on the next

@@ -575,6 +575,60 @@ check "old bouncer destroyed" gone "app_oldname-pgbouncer"
 check "old network destroyed" gone "net_pgbouncer-oldname"
 check "service released" eq "$(psn mydb)" ""
 
+# --- 19b. connect after apps:rename -----------------------------------------
+# Every name connect would derive comes from the app name, but an app renamed
+# since its first connect owns a pooler and a network named after a name it no
+# longer carries. Re-running connect is the documented way to apply rotated
+# credentials, so it has to find them: deriving the names made it read the app's
+# own claim on the postgres service as another app's and abort.
+setup "connect after a rename reuses the existing pooler"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'true' >"$STATE/deployed_newname"
+printf 'true' >"$STATE/running_newname"
+printf 'true' >"$STATE/deployed_oldname-pgbouncer"
+printf 'postgres://postgres:rotated456@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_newname_DATABASE_URL"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'postgres://postgres:secret123@oldname-pgbouncer.web:6432/mydb' >"$STATE/cfg_newname_PGBOUNCER_URL"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'edoburu/pgbouncer:v1.25.2-p0' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_IMAGE"
+printf 'pgbouncer-oldname' >"$STATE/psn_mydb"
+printf 'pgbouncer-oldname' >"$STATE/apc_newname"
+printf 'dokku.postgres.mydb\nnewname.web.1\n' >"$STATE/netmembers_pgbouncer-oldname"
+run pgbouncer:connect newname mydb
+check "exits 0" eq "$RC" "0"
+check "says which pooler it found" has "$OUT" "records its pgbouncer as 'oldname-pgbouncer'"
+check "no second pgbouncer app" not called "dokku apps:create newname-pgbouncer"
+check "no second network" not called "dokku network:create pgbouncer-newname"
+check "rotated credentials applied" eq "$(cfg oldname-pgbouncer DB_PASSWORD)" "rotated456"
+check "url still names the running pooler" eq "$(cfg newname PGBOUNCER_URL)" "postgres://postgres:rotated456@oldname-pgbouncer.web:6432/mydb"
+check "service claim untouched" eq "$(psn mydb)" "pgbouncer-oldname"
+check "app stays on the existing network" eq "$(apc newname)" "pgbouncer-oldname"
+
+# With the claim on the service cleared by hand — which is what the misleading
+# "another app's pgbouncer" message used to invite — deriving the names went on
+# to build a whole second pooler and overwrote the only pointer to the first,
+# leaving it orphaned with the database password in its config.
+setup "connect after a rename does not build a second pooler"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer" "$STATE/net_pgbouncer-oldname"
+printf 'true' >"$STATE/deployed_newname"
+printf 'true' >"$STATE/running_newname"
+printf 'true' >"$STATE/deployed_oldname-pgbouncer"
+printf 'postgres://postgres:secret123@dokku-postgres-mydb:5432/mydb' >"$STATE/cfg_newname_DATABASE_URL"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-oldname' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'edoburu/pgbouncer:v1.25.2-p0' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_IMAGE"
+printf 'pgbouncer-oldname' >"$STATE/apc_newname"
+printf 'dokku.postgres.mydb\nnewname.web.1\n' >"$STATE/netmembers_pgbouncer-oldname"
+run pgbouncer:connect newname mydb
+check "exits 0" eq "$RC" "0"
+check "no second pgbouncer app" gone "app_newname-pgbouncer"
+check "no second network" gone "net_pgbouncer-newname"
+check "pointer still names the one pooler" eq "$(cfg newname PGBOUNCER_HOST)" "oldname-pgbouncer.web"
+check "claims the service for the existing network" eq "$(psn mydb)" "pgbouncer-oldname"
+check "app on one network only" eq "$(apc newname)" "pgbouncer-oldname"
+
 # --- 20. post-delete cleans up after apps:destroy ---------------------------
 setup "post-delete releases everything the app left behind"
 touch "$STATE/app_myapp-pgbouncer" "$STATE/net_pgbouncer-myapp"
