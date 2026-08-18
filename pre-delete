@@ -23,6 +23,18 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
 APP="${1:-}"
 [[ -z "$APP" ]] && exit 0
 
+# A note from an earlier destroy that never reached post-delete is still lying
+# there: dokku aborts the destroy if any pre-delete trigger returns non-zero, and
+# post-delete — the only thing that consumes a note — then never runs. Taken at
+# face value later it sends post-delete after a pgbouncer app the destroyed app
+# no longer owns; finding no marker on it, the whole teardown is skipped, and the
+# setup that really is there keeps the postgres service's single-valued
+# post-start-network with no command left that would release it. That is the
+# exact leak this pair of hooks exists to prevent, so no note outlives the run
+# that wrote it: every path below either writes a fresh one or has established
+# that post-delete needs none.
+rm -f "$(delete_note "$APP")" 2>/dev/null || true
+
 # Destroying the pooler out from under the app it serves is not something this
 # plugin can undo afterwards: the app keeps a PGBOUNCER_URL whose host stops
 # resolving, and neither the network nor the postgres service gets released.

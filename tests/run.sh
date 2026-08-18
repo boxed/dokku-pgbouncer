@@ -636,6 +636,34 @@ run_hook pre-delete myapp some-image-tag
 check "exits 0" eq "$RC" "0"
 check "no note" not note myapp
 
+# dokku aborts the destroy if any pre-delete trigger returns non-zero, and
+# post-delete — the only thing that consumes a note — then never runs. A note
+# left behind that way must not be believed by the next destroy: it names the
+# pgbouncer app the setup used to have, so post-delete would find no marker on it
+# and skip the teardown for the pooler that really is there.
+setup "a stale delete note does not disable the next teardown"
+touch "$STATE/app_newname" "$STATE/app_oldname-pgbouncer"
+printf 'oldname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+run_hook pre-delete newname some-image-tag
+check "note written" note newname
+# The destroy is aborted. The operator then brings the names back in line, which
+# is what post-app-rename tells them to do, so the app owns 'newname-pgbouncer'.
+rm -f "$STATE/app_oldname-pgbouncer" "$STATE/cfg_oldname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+touch "$STATE/app_newname-pgbouncer" "$STATE/net_pgbouncer-newname"
+printf 'newname-pgbouncer.web' >"$STATE/cfg_newname_PGBOUNCER_HOST"
+printf 'mydb' >"$STATE/cfg_newname-pgbouncer_DOKKU_PGBOUNCER_DB_SERVICE"
+printf 'pgbouncer-newname' >"$STATE/cfg_newname-pgbouncer_DOKKU_PGBOUNCER_NETWORK"
+printf 'pgbouncer-newname' >"$STATE/psn_mydb"
+run_hook pre-delete newname some-image-tag
+check "stale note cleared" not note newname
+rm -f "$STATE/app_newname" # dokku destroys the app between the two hooks
+run_hook post-delete newname
+check "post-delete exits 0" eq "$RC" "0"
+check "the pooler it really has is destroyed" gone "app_newname-pgbouncer"
+check "service released" eq "$(psn mydb)" ""
+check "network destroyed" gone "net_pgbouncer-newname"
+
 setup "pre-delete is a no-op for an app without pgbouncer"
 run_hook pre-delete myapp some-image-tag
 check "exits 0" eq "$RC" "0"
