@@ -308,6 +308,41 @@ check "fails" eq "$RC" "1"
 check "env vars rolled back" eq "$(cfg myapp PGBOUNCER_URL)" ""
 check "networks restored" eq "$(apc myapp)" "othernet"
 
+# The restart is the last step, so a failure there rolls back a setup that was
+# otherwise complete — and the cause is always about the app. Read on its own the
+# log looked like pgbouncer breaking the app, with nothing to act on.
+setup "a failed restart says what actually went wrong"
+printf 'othernet' >"$STATE/apc_myapp"
+touch "$STATE/net_othernet" "$STATE/fail_ps_restart_myapp"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "points at the app, not the pooler" has "$OUT" "independently of pgbouncer"
+check "says the pgbouncer side worked" has "$OUT" "'SELECT 1' through it to mydb succeeded"
+# dokku says only "App image (dokku/myapp:latest) not found", which does not
+# explain how an app it calls deployed can have no image.
+check "names the missing image" has "$OUT" "'dokku/myapp:latest' is not on this host"
+check "explains what deployed means" has "$OUT" "has had containers before"
+check "gives the fix" has "$OUT" "dokku ps:rebuild myapp"
+check "says nothing is half-applied" has "$OUT" "Nothing is left half-applied"
+check "gives the command to re-run" has "$OUT" "re-run: dokku pgbouncer:connect myapp mydb"
+check "labels the rollback" has "$OUT" "Rolling back everything this command changed"
+# The rollback's own restart fails for the same reason, and the app is then down
+# rather than merely holding a stale variable.
+check "does not understate the rollback restart" has "$OUT" "may have been stopped altogether"
+check "says how to bring it back" has "$OUT" "dokku ps:restart myapp"
+
+# With the image present the cause is something else, so the image hint must not
+# fire and send the operator off rebuilding for nothing. A plugin can point dokku
+# at another repository, which is why the hint is conditional at all.
+setup "a failed restart with the image present does not blame the image"
+printf 'othernet' >"$STATE/apc_myapp"
+touch "$STATE/net_othernet" "$STATE/fail_ps_restart_myapp" "$STATE/image_dokku_myapp_latest"
+run pgbouncer:connect myapp mydb
+check "fails" eq "$RC" "1"
+check "no image hint" hasnt "$OUT" "is not on this host"
+check "no rebuild advice" hasnt "$OUT" "ps:rebuild"
+check "still points at the app" has "$OUT" "independently of pgbouncer"
+
 setup "rollback when the service already backs another pgbouncer"
 printf 'othernet' >"$STATE/apc_myapp"
 touch "$STATE/net_othernet"

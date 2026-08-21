@@ -250,7 +250,16 @@ case "$1" in
       # reconfigured by this run.
       if [[ "$MAIN_APP_RESTARTED" == "true" || -n "$HAD_PGBOUNCER_URL" ]]; then
         dokku_log_info1 "Restarting $MAIN_APP so its containers drop back to direct postgres"
-        dokku ps:restart "$MAIN_APP" || dokku_log_warn "Failed to restart $MAIN_APP during rollback; its containers may still be using PGBOUNCER_URL"
+        # Usually the same cause as whatever failure got us here, so say what
+        # state that leaves the app in rather than only that a step failed. The
+        # old wording named the containers still holding PGBOUNCER_URL, which
+        # understates it: an app dokku cannot restart may have been stopped on
+        # the way and have no containers at all.
+        if ! dokku ps:restart "$MAIN_APP"; then
+          dokku_log_warn "Failed to restart $MAIN_APP during rollback."
+          dokku_log_warn "Its config is back on direct postgres, but its containers were not recreated: any still up hold PGBOUNCER_URL, and $MAIN_APP may have been stopped altogether."
+          dokku_log_warn "Restart it once it can start on its own again: dokku ps:restart $MAIN_APP"
+        fi
       fi
     }
 
@@ -307,6 +316,10 @@ case "$1" in
     # again.
     fail_and_rollback() {
       trap - INT TERM
+      # Announced, because the steps below are mostly dokku's own output —
+      # "Unsetting post-start-network", "Unsetting attach-post-create" — and
+      # unlabelled they read like part of the setup rather than its undoing.
+      dokku_log_info1 "Rolling back everything this command changed"
       rollback_services
       rollback_bouncer_app
       rollback_main_app
@@ -589,8 +602,25 @@ case "$1" in
     # rollback has to restart the app in that case too.
     MAIN_APP_RESTARTED=true
     if ! dokku ps:restart "$MAIN_APP"; then
-      dokku_log_warn "Restart of $MAIN_APP failed, rolling back pgbouncer setup on $MAIN_APP"
-      fail_and_rollback "Failed to restart $MAIN_APP; the pgbouncer setup on $MAIN_APP was rolled back"
+      # This is the last step, so a failure here rolls back a setup that was
+      # otherwise complete and verified — and the cause is always something about
+      # the app rather than about pgbouncer. Left to speak for itself that reads
+      # as "pgbouncer broke my app", so name where the fault is, what state the
+      # app is in, and what to do next.
+      dokku_log_warn "'dokku ps:restart $MAIN_APP' failed. Its output is above, and it is the real cause: something is stopping $MAIN_APP from starting, independently of pgbouncer."
+      dokku_log_warn "The pgbouncer side is fine: $BOUNCER_APP is deployed and a 'SELECT 1' through it to $DB_SERVICE succeeded a moment ago. The restart is only how $MAIN_APP's containers get onto network $NETWORK_NAME."
+      # dokku's own message for this is "App image (dokku/<app>:latest) not
+      # found", which does not explain how an app it calls deployed can have no
+      # image: 'deployed' means dokku has created containers for the app before,
+      # not that it can still start one. Only offered when the default image name
+      # really is absent — a plugin can point dokku at another repository, and
+      # then this would send the operator rebuilding for nothing.
+      if ! docker image inspect "dokku/${MAIN_APP}:latest" >/dev/null 2>&1; then
+        dokku_log_warn "Image 'dokku/${MAIN_APP}:latest' is not on this host. dokku calls $MAIN_APP deployed because it has had containers before, not because it can still start one, so a pruned or removed image looks exactly like this."
+        dokku_log_warn "Build it again — 'git push dokku <branch>' for a git app, or 'dokku ps:rebuild $MAIN_APP' — and check it comes up: dokku ps:report $MAIN_APP --running"
+      fi
+      dokku_log_warn "Nothing is left half-applied; the rollback below puts $MAIN_APP back exactly as it was. Once it restarts on its own, re-run: dokku pgbouncer:connect $MAIN_APP $DB_SERVICE"
+      fail_and_rollback "Failed to restart $MAIN_APP; the pgbouncer setup on $MAIN_APP was rolled back and it is back on direct postgres"
     fi
 
     # Confirm the recreated containers actually joined the network; if not, roll
